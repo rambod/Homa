@@ -16,6 +16,7 @@ use crate::network::sync_engine::{
     ChunkRequestScheduler, ChunkSessionManager, ChunkSessionPolicy, RequestSchedulerPolicy,
     SessionSchedule, SyncEngineError,
 };
+use crate::observability::Observability;
 
 /// Outcome of scheduling one outbound snapshot chunk request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +207,17 @@ pub struct ImportedSnapshot {
     pub state_root: [u8; 32],
 }
 
+/// Batch import processing outcome for queued completed snapshots.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SnapshotImportBatchOutcome {
+    /// Successfully imported snapshots in processing order.
+    pub imported: Vec<ImportedSnapshot>,
+    /// Snapshots quarantined during this batch due to repeated import failures.
+    pub quarantined: Vec<QuarantinedSnapshot>,
+    /// First blocking error that prevented further progress this batch.
+    pub blocked: Option<SyncRuntimeError>,
+}
+
 /// Runtime orchestration errors for sync request/response coordination.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum SyncRuntimeError {
@@ -286,18 +298,28 @@ pub enum SyncRuntimeError {
         source: SyncError,
     },
     /// Snapshot import verification or state-load operation failed.
-    #[error("snapshot import failure")]
+    #[error(
+        "snapshot import failure at height {block_height} (state_root={state_root:?}, failure_count={failure_count})"
+    )]
     SnapshotImport {
+        /// Snapshot height that failed import.
+        block_height: u64,
+        /// Snapshot state root that failed import.
+        state_root: [u8; 32],
+        /// Consecutive failed attempt count for this queued snapshot.
+        failure_count: u32,
         /// Underlying snapshot import error.
         source: SyncError,
     },
     /// Snapshot import exceeded failure budget and was quarantined.
     #[error(
-        "snapshot import quarantined at height {block_height} after {failure_count} consecutive failures"
+        "snapshot import quarantined at height {block_height} (state_root={state_root:?}) after {failure_count} consecutive failures"
     )]
     SnapshotImportQuarantined {
         /// Snapshot height that was quarantined.
         block_height: u64,
+        /// Snapshot state root that was quarantined.
+        state_root: [u8; 32],
         /// Failure count observed before quarantine.
         failure_count: u32,
         /// Underlying typed import error that triggered quarantine.
@@ -655,6 +677,44 @@ impl SyncRuntimeCoordinator {
         )
     }
 
+    /// Imports queued completed snapshots until queue drains or a non-quarantine failure blocks progress.
+    pub fn import_completed_snapshot_batch(
+        &mut self,
+        state: &mut ChainState,
+        finalized_block: &Block,
+        import_mode: SnapshotImportMode,
+        observability: Option<&Observability>,
+    ) -> SnapshotImportBatchOutcome {
+        self.import_completed_snapshot_batch_inner(
+            state,
+            finalized_block,
+            None,
+            None,
+            import_mode,
+            observability,
+        )
+    }
+
+    /// Imports queued completed snapshots with checkpoint verification until queue drains or one failure blocks progress.
+    pub fn import_completed_snapshot_batch_with_checkpoint(
+        &mut self,
+        state: &mut ChainState,
+        finalized_block: &Block,
+        checkpoint: &SnapshotCheckpoint,
+        checkpoint_policy: CheckpointVerificationPolicy<'_>,
+        import_mode: SnapshotImportMode,
+        observability: Option<&Observability>,
+    ) -> SnapshotImportBatchOutcome {
+        self.import_completed_snapshot_batch_inner(
+            state,
+            finalized_block,
+            Some(checkpoint),
+            Some(checkpoint_policy),
+            import_mode,
+            observability,
+        )
+    }
+
     fn ingest_response_chunk(
         &mut self,
         response: &SnapshotChunkResponse,
@@ -750,6 +810,8 @@ impl SyncRuntimeCoordinator {
             };
             front.failed_import_attempts = front.failed_import_attempts.saturating_add(1);
             let failure_count = front.failed_import_attempts;
+            let block_height = completed.snapshot.block_height;
+            let state_root = completed.snapshot.state_root;
             if failure_count >= self.import_failure_policy.max_consecutive_failures {
                 let quarantined =
                     self.completed_snapshots
@@ -761,16 +823,21 @@ impl SyncRuntimeCoordinator {
                             last_error: source.clone(),
                         });
                 if let Some(quarantined) = quarantined {
-                    let block_height = quarantined.snapshot.block_height;
                     self.quarantined_snapshots.push_back(quarantined);
                     return Err(SyncRuntimeError::SnapshotImportQuarantined {
                         block_height,
+                        state_root,
                         failure_count,
                         source,
                     });
                 }
             }
-            return Err(SyncRuntimeError::SnapshotImport { source });
+            return Err(SyncRuntimeError::SnapshotImport {
+                block_height,
+                state_root,
+                failure_count,
+                source,
+            });
         }
 
         let imported = ImportedSnapshot {
@@ -780,6 +847,90 @@ impl SyncRuntimeCoordinator {
         };
         let _ = self.completed_snapshots.pop_front();
         Ok(Some(imported))
+    }
+
+    fn import_completed_snapshot_batch_inner(
+        &mut self,
+        state: &mut ChainState,
+        finalized_block: &Block,
+        checkpoint: Option<&SnapshotCheckpoint>,
+        checkpoint_policy: Option<CheckpointVerificationPolicy<'_>>,
+        import_mode: SnapshotImportMode,
+        observability: Option<&Observability>,
+    ) -> SnapshotImportBatchOutcome {
+        let mut outcome = SnapshotImportBatchOutcome::default();
+        loop {
+            let result = self.import_next_completed_snapshot_inner(
+                state,
+                finalized_block,
+                checkpoint,
+                checkpoint_policy,
+                import_mode,
+            );
+            record_snapshot_import_observability(observability, &result);
+
+            match result {
+                Ok(Some(imported)) => outcome.imported.push(imported),
+                Ok(None) => break,
+                Err(SyncRuntimeError::SnapshotImportQuarantined {
+                    block_height: _,
+                    state_root: _,
+                    failure_count: _,
+                    source: _,
+                }) => {
+                    if let Some(quarantined) = self.quarantined_snapshots.back() {
+                        outcome.quarantined.push(quarantined.clone());
+                    }
+                }
+                Err(error) => {
+                    outcome.blocked = Some(error);
+                    break;
+                }
+            }
+        }
+        outcome
+    }
+}
+
+fn record_snapshot_import_observability(
+    observability: Option<&Observability>,
+    result: &Result<Option<ImportedSnapshot>, SyncRuntimeError>,
+) {
+    let Some(observability) = observability else {
+        return;
+    };
+    match result {
+        Ok(Some(imported)) => {
+            observability
+                .record_snapshot_import_success(imported.block_height, imported.state_root);
+        }
+        Err(SyncRuntimeError::SnapshotImport {
+            block_height,
+            state_root,
+            failure_count,
+            source,
+        }) => {
+            observability.record_snapshot_import_failure(
+                *block_height,
+                *state_root,
+                *failure_count,
+                &source.to_string(),
+            );
+        }
+        Err(SyncRuntimeError::SnapshotImportQuarantined {
+            block_height,
+            state_root,
+            failure_count,
+            source,
+        }) => {
+            observability.record_snapshot_quarantine(
+                *block_height,
+                *state_root,
+                *failure_count,
+                &source.to_string(),
+            );
+        }
+        Ok(None) | Err(_) => {}
     }
 }
 
@@ -863,6 +1014,7 @@ mod tests {
     use crate::crypto::keys::Keypair;
     use crate::network::p2p::{SnapshotChunkRequest, SnapshotChunkResponse};
     use crate::network::sync_engine::{ChunkSessionPolicy, RequestSchedulerPolicy};
+    use crate::observability::{Observability, ObservabilityEventKind, SnapshotImportOutcome};
 
     fn sample_chunk() -> crate::core::sync::SnapshotChunk {
         let snapshot = StateSnapshot {
@@ -1415,6 +1567,9 @@ mod tests {
             matches!(
                 imported,
                 Err(SyncRuntimeError::SnapshotImport {
+                    block_height: 40,
+                    state_root: _,
+                    failure_count: 1,
                     source: SyncError::SnapshotRollbackRejected {
                         local_finalized_height: 41,
                         snapshot_height: 40
@@ -1458,6 +1613,9 @@ mod tests {
             matches!(
                 first_attempt,
                 Err(SyncRuntimeError::SnapshotImport {
+                    block_height: 40,
+                    state_root: _,
+                    failure_count: 1,
                     source: SyncError::SnapshotRollbackRejected { .. }
                 })
             ),
@@ -1478,6 +1636,7 @@ mod tests {
                 second_attempt,
                 Err(SyncRuntimeError::SnapshotImportQuarantined {
                     block_height: 40,
+                    state_root: _,
                     failure_count: 2,
                     source: SyncError::SnapshotRollbackRejected {
                         local_finalized_height: 41,
@@ -1557,6 +1716,7 @@ mod tests {
                 first_attempt,
                 Err(SyncRuntimeError::SnapshotImportQuarantined {
                     block_height: 40,
+                    state_root: _,
                     failure_count: 1,
                     source: SyncError::SnapshotRollbackRejected { .. }
                 })
@@ -1586,6 +1746,156 @@ mod tests {
         );
         assert_eq!(runtime.completed_snapshot_count(), 0);
         assert_eq!(runtime.quarantined_snapshot_count(), 1);
+    }
+
+    #[test]
+    fn import_batch_continues_after_quarantine_and_records_observability() {
+        let network = Network::Testnet;
+
+        let mut old_state = ChainState::new(network);
+        let old_initialized = old_state.initialize_genesis(vec![(valid_address(network), 150)]);
+        assert!(
+            old_initialized.is_ok(),
+            "old snapshot fixture should initialize"
+        );
+        let old_snapshot = build_state_snapshot(&old_state, 60);
+
+        let mut next_state = ChainState::new(network);
+        let next_initialized = next_state.initialize_genesis(vec![(valid_address(network), 250)]);
+        assert!(
+            next_initialized.is_ok(),
+            "next snapshot fixture should initialize"
+        );
+        let next_snapshot = build_state_snapshot(&next_state, 60);
+
+        let mut runtime = runtime_with_import_failure_policy(SnapshotImportFailurePolicy {
+            max_consecutive_failures: 1,
+        });
+        let mut old_runtime = runtime_with_completed_snapshot(&old_snapshot);
+        let mut next_runtime = runtime_with_completed_snapshot(&next_snapshot);
+        runtime
+            .completed_snapshots
+            .append(&mut old_runtime.completed_snapshots);
+        runtime
+            .completed_snapshots
+            .append(&mut next_runtime.completed_snapshots);
+
+        let observability = Observability::new(8);
+        let finalized_block = finalized_block_for_snapshot(&next_snapshot, valid_address(network));
+        let mut target_state = ChainState::new(network);
+        let outcome = runtime.import_completed_snapshot_batch(
+            &mut target_state,
+            &finalized_block,
+            SnapshotImportMode::BootstrapRecovery,
+            Some(&observability),
+        );
+
+        assert!(
+            outcome.blocked.is_none(),
+            "batch import should continue after quarantine and not remain blocked"
+        );
+        assert_eq!(outcome.quarantined.len(), 1);
+        assert_eq!(outcome.quarantined[0].snapshot.block_height, 60);
+        assert_eq!(outcome.imported.len(), 1);
+        assert_eq!(outcome.imported[0].block_height, 60);
+        assert_eq!(runtime.completed_snapshot_count(), 0);
+        assert_eq!(runtime.quarantined_snapshot_count(), 1);
+        assert_eq!(
+            target_state.account_entries(),
+            next_state.account_entries(),
+            "batch import should advance to follower snapshot after quarantine"
+        );
+
+        assert_eq!(observability.snapshot_import_success_total(), 1);
+        assert_eq!(observability.snapshot_import_failure_total(), 0);
+        assert_eq!(observability.snapshot_quarantine_total(), 1);
+        let snapshot = observability.snapshot();
+        assert_eq!(snapshot.recent_events.len(), 2);
+        assert!(matches!(
+            snapshot.recent_events[0].kind,
+            ObservabilityEventKind::SnapshotImport {
+                outcome: SnapshotImportOutcome::Quarantined,
+                ..
+            }
+        ));
+        assert!(matches!(
+            snapshot.recent_events[1].kind,
+            ObservabilityEventKind::SnapshotImport {
+                outcome: SnapshotImportOutcome::Success,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn import_batch_stops_on_retryable_failure_and_records_observability() {
+        let network = Network::Testnet;
+        let mut bad_state = ChainState::new(network);
+        let bad_initialized = bad_state.initialize_genesis(vec![(valid_address(network), 1_500)]);
+        assert!(
+            bad_initialized.is_ok(),
+            "bad snapshot fixture should initialize"
+        );
+        let bad_snapshot = build_state_snapshot(&bad_state, 40);
+
+        let mut finalized_state = ChainState::new(network);
+        let finalized_initialized =
+            finalized_state.initialize_genesis(vec![(valid_address(network), 2_500)]);
+        assert!(
+            finalized_initialized.is_ok(),
+            "finalized block fixture should initialize"
+        );
+        let finalized_snapshot = build_state_snapshot(&finalized_state, 40);
+
+        let mut runtime = runtime_with_import_failure_policy(SnapshotImportFailurePolicy {
+            max_consecutive_failures: 2,
+        });
+        let mut seeded_runtime = runtime_with_completed_snapshot(&bad_snapshot);
+        runtime
+            .completed_snapshots
+            .append(&mut seeded_runtime.completed_snapshots);
+
+        let observability = Observability::new(8);
+        let finalized_block =
+            finalized_block_for_snapshot(&finalized_snapshot, valid_address(network));
+        let mut target_state = ChainState::new(network);
+        let outcome = runtime.import_completed_snapshot_batch(
+            &mut target_state,
+            &finalized_block,
+            SnapshotImportMode::BootstrapRecovery,
+            Some(&observability),
+        );
+
+        assert_eq!(outcome.imported.len(), 0);
+        assert_eq!(outcome.quarantined.len(), 0);
+        assert!(
+            matches!(
+                outcome.blocked,
+                Some(SyncRuntimeError::SnapshotImport {
+                    block_height: 40,
+                    state_root: _,
+                    failure_count: 1,
+                    source: SyncError::StateRootMismatch { .. }
+                })
+            ),
+            "batch import should stop at first retryable queue-head failure"
+        );
+        assert_eq!(runtime.completed_snapshot_count(), 1);
+        assert_eq!(runtime.quarantined_snapshot_count(), 0);
+
+        assert_eq!(observability.snapshot_import_success_total(), 0);
+        assert_eq!(observability.snapshot_import_failure_total(), 1);
+        assert_eq!(observability.snapshot_quarantine_total(), 0);
+        let snapshot = observability.snapshot();
+        assert_eq!(snapshot.recent_events.len(), 1);
+        assert!(matches!(
+            snapshot.recent_events[0].kind,
+            ObservabilityEventKind::SnapshotImport {
+                outcome: SnapshotImportOutcome::Failed,
+                failure_count: 1,
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -16,6 +16,9 @@ pub struct Observability {
     slot_miss_total: AtomicU64,
     gossip_failure_total: AtomicU64,
     sync_lag_blocks: AtomicU64,
+    snapshot_import_success_total: AtomicU64,
+    snapshot_import_failure_total: AtomicU64,
+    snapshot_quarantine_total: AtomicU64,
     event_capacity: usize,
     recent_events: Mutex<VecDeque<ObservabilityEvent>>,
 }
@@ -35,6 +38,12 @@ pub struct ObservabilitySnapshot {
     pub gossip_failure_total: u64,
     /// Current sync lag gauge in blocks.
     pub sync_lag_blocks: u64,
+    /// Total number of successful snapshot imports.
+    pub snapshot_import_success_total: u64,
+    /// Total number of failed snapshot import attempts.
+    pub snapshot_import_failure_total: u64,
+    /// Total number of snapshot quarantine actions.
+    pub snapshot_quarantine_total: u64,
     /// Most recent structured events.
     pub recent_events: Vec<ObservabilityEvent>,
 }
@@ -83,6 +92,19 @@ pub enum ObservabilityEventKind {
         /// Derived lag in blocks.
         lag_blocks: u64,
     },
+    /// Snapshot import attempt outcome.
+    SnapshotImport {
+        /// Snapshot block height being imported.
+        block_height: u64,
+        /// Snapshot state root being imported.
+        state_root: [u8; 32],
+        /// Import outcome class.
+        outcome: SnapshotImportOutcome,
+        /// Consecutive failure attempts for this queue-head snapshot.
+        failure_count: u32,
+        /// Optional typed error context.
+        error: Option<String>,
+    },
 }
 
 /// Slot-miss reason classes.
@@ -109,6 +131,18 @@ pub enum GossipOperation {
     Publish,
 }
 
+/// Snapshot import outcome classes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotImportOutcome {
+    /// Snapshot import succeeded and was applied to state.
+    Success,
+    /// Snapshot import failed but remains queued for retry.
+    Failed,
+    /// Snapshot import failed and was quarantined.
+    Quarantined,
+}
+
 impl Observability {
     /// Creates a new collector with bounded event history.
     #[must_use]
@@ -118,6 +152,9 @@ impl Observability {
             slot_miss_total: AtomicU64::new(0),
             gossip_failure_total: AtomicU64::new(0),
             sync_lag_blocks: AtomicU64::new(0),
+            snapshot_import_success_total: AtomicU64::new(0),
+            snapshot_import_failure_total: AtomicU64::new(0),
+            snapshot_quarantine_total: AtomicU64::new(0),
             event_capacity: bounded_capacity,
             recent_events: Mutex::new(VecDeque::with_capacity(bounded_capacity)),
         }
@@ -168,6 +205,57 @@ impl Observability {
         });
     }
 
+    /// Records one successful snapshot import application.
+    pub fn record_snapshot_import_success(&self, block_height: u64, state_root: [u8; 32]) {
+        self.snapshot_import_success_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.push_event(ObservabilityEventKind::SnapshotImport {
+            block_height,
+            state_root,
+            outcome: SnapshotImportOutcome::Success,
+            failure_count: 0,
+            error: None,
+        });
+    }
+
+    /// Records one failed snapshot import attempt that remains queued.
+    pub fn record_snapshot_import_failure(
+        &self,
+        block_height: u64,
+        state_root: [u8; 32],
+        failure_count: u32,
+        error: &str,
+    ) {
+        self.snapshot_import_failure_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.push_event(ObservabilityEventKind::SnapshotImport {
+            block_height,
+            state_root,
+            outcome: SnapshotImportOutcome::Failed,
+            failure_count,
+            error: Some(error.to_owned()),
+        });
+    }
+
+    /// Records one snapshot quarantine action after repeated import failures.
+    pub fn record_snapshot_quarantine(
+        &self,
+        block_height: u64,
+        state_root: [u8; 32],
+        failure_count: u32,
+        error: &str,
+    ) {
+        self.snapshot_quarantine_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.push_event(ObservabilityEventKind::SnapshotImport {
+            block_height,
+            state_root,
+            outcome: SnapshotImportOutcome::Quarantined,
+            failure_count,
+            error: Some(error.to_owned()),
+        });
+    }
+
     /// Returns total slot misses.
     #[must_use]
     pub fn slot_miss_total(&self) -> u64 {
@@ -186,6 +274,24 @@ impl Observability {
         self.sync_lag_blocks.load(Ordering::Relaxed)
     }
 
+    /// Returns total successful snapshot imports.
+    #[must_use]
+    pub fn snapshot_import_success_total(&self) -> u64 {
+        self.snapshot_import_success_total.load(Ordering::Relaxed)
+    }
+
+    /// Returns total failed snapshot import attempts.
+    #[must_use]
+    pub fn snapshot_import_failure_total(&self) -> u64 {
+        self.snapshot_import_failure_total.load(Ordering::Relaxed)
+    }
+
+    /// Returns total snapshot quarantines.
+    #[must_use]
+    pub fn snapshot_quarantine_total(&self) -> u64 {
+        self.snapshot_quarantine_total.load(Ordering::Relaxed)
+    }
+
     /// Returns an immutable snapshot of metrics and bounded recent events.
     #[must_use]
     pub fn snapshot(&self) -> ObservabilitySnapshot {
@@ -198,6 +304,9 @@ impl Observability {
             slot_miss_total: self.slot_miss_total(),
             gossip_failure_total: self.gossip_failure_total(),
             sync_lag_blocks: self.sync_lag_blocks(),
+            snapshot_import_success_total: self.snapshot_import_success_total(),
+            snapshot_import_failure_total: self.snapshot_import_failure_total(),
+            snapshot_quarantine_total: self.snapshot_quarantine_total(),
             recent_events,
         }
     }
@@ -225,7 +334,10 @@ fn now_unix_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{GossipOperation, Observability, ObservabilityEventKind, SlotMissReason};
+    use super::{
+        GossipOperation, Observability, ObservabilityEventKind, SlotMissReason,
+        SnapshotImportOutcome,
+    };
 
     #[test]
     fn records_slot_miss_metrics_and_event() {
@@ -301,6 +413,50 @@ mod tests {
         assert!(matches!(
             snapshot.recent_events[1].kind,
             ObservabilityEventKind::SyncLag { lag_blocks: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn records_snapshot_import_lifecycle_metrics_and_events() {
+        let observability = Observability::new(8);
+        let root = [9_u8; 32];
+
+        observability.record_snapshot_import_success(44, root);
+        observability.record_snapshot_import_failure(44, root, 1, "rollback rejected");
+        observability.record_snapshot_quarantine(44, root, 3, "rollback rejected");
+
+        assert_eq!(observability.snapshot_import_success_total(), 1);
+        assert_eq!(observability.snapshot_import_failure_total(), 1);
+        assert_eq!(observability.snapshot_quarantine_total(), 1);
+
+        let snapshot = observability.snapshot();
+        assert_eq!(snapshot.snapshot_import_success_total, 1);
+        assert_eq!(snapshot.snapshot_import_failure_total, 1);
+        assert_eq!(snapshot.snapshot_quarantine_total, 1);
+        assert_eq!(snapshot.recent_events.len(), 3);
+        assert!(matches!(
+            snapshot.recent_events[0].kind,
+            ObservabilityEventKind::SnapshotImport {
+                outcome: SnapshotImportOutcome::Success,
+                failure_count: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            snapshot.recent_events[1].kind,
+            ObservabilityEventKind::SnapshotImport {
+                outcome: SnapshotImportOutcome::Failed,
+                failure_count: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            snapshot.recent_events[2].kind,
+            ObservabilityEventKind::SnapshotImport {
+                outcome: SnapshotImportOutcome::Quarantined,
+                failure_count: 3,
+                ..
+            }
         ));
     }
 }
