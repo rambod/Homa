@@ -1,0 +1,74 @@
+[package]
+name = "homa"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+publish = false
+resolver = "2"
+
+[[bin]]
+name = "homa-cli"
+path = "src/main.rs"
+
+[dependencies]
+blake3 = { version = "1", features = ["rayon"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+bs58 = { version = "0.5", features = ["check"] }
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+bincode = { version = "2", features = ["serde"] }
+thiserror = "2"
+zeroize = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+futures = "0.3"
+libp2p = { version = "0.56", features = ["tcp", "quic", "dns", "noise", "yamux", "gossipsub", "kad", "macros", "tokio"] }
+hickory-resolver = { version = "0.25", default-features = true }
+clap = { version = "4.5", features = ["derive", "env"] }
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+serde_json = "1"
+rpassword = "7"
+
+[dev-dependencies]
+proptest = "1"
+hex = "0.4"
+
+[lints.rust]
+unsafe_code = "forbid"
+warnings = "deny"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unused_must_use = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[profile.dev]
+opt-level = 1
+debug = 2
+overflow-checks = true
+incremental = true
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = 1
+incremental = false
+
+[profile.bench]
+inherits = "release"

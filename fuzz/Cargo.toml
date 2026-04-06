@@ -1,0 +1,21 @@
+[package]
+name = "homa-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.homa]
+path = ".."
+
+[[bin]]
+name = "gossipsub_tx_payload"
+path = "fuzz_targets/gossipsub_tx_payload.rs"
+test = false
+doc = false
+bench = false

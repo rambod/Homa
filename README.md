@@ -1,0 +1,249 @@
+# Homa (HMA)
+
+Homa is a pure Rust Layer-1 blockchain project implementing a hybrid model:
+
+- stake-weighted proposer selection (PoS side)
+- client-side proof-of-work per transaction (PoW side)
+
+This repository currently contains the protocol core, networking/sync hardening primitives, and a wallet CLI (`homa-cli`).
+
+## Project Status
+
+Homa is in active pre-alpha development.
+
+Implemented in this repository today:
+
+- core ledger/state/block/transaction primitives
+- deterministic fork-choice and partition reconciliation helpers
+- snapshot fast-sync with checkpoint verification and anti-rollback protections
+- P2P transport and sync wire codecs
+- peer reputation, adaptive penalties, and checkpoint-trust rotation logic
+- wallet CLI for key generation and transaction broadcasting
+- deterministic chaos and fuzz testing harnesses
+
+Not implemented yet (production gaps):
+
+- full long-running node daemon
+- RPC/REST/GraphQL APIs
+- persistent mempool/indexer pipeline
+- validator operations tooling and deployment automation
+
+## Design Highlights
+
+- `Pure Rust` codebase with strict linting and no `unsafe`.
+- `Hybrid consensus`: deterministic stake-weighted leader election plus transaction-level PoW admission signal.
+- `Hard supply cap`: `36,000,000 HMA` (`3_600_000_000_000_000` micro-homa).
+- `Network-domain separation`: transaction and checkpoint signatures are bound to network IDs.
+- `Fast sync hardening`:
+  - snapshot payload/state-root verification
+  - admission limits (size/account caps)
+  - chunked sync with per-chunk integrity hashes
+  - rollback-safe import mode checks
+- `Abuse resistance`:
+  - peer reputation scoring + decay + temporary bans
+  - adaptive dial cooldown and serve throttling
+  - sync-session checkpoint persistence for restart recovery
+  - signed checkpoint trusted-set rotation with deterministic activation
+
+## Repository Layout
+
+- `src/consensus/`
+  - `stake.rs`: validator stake accounting
+  - `leader.rs`: deterministic stake-weighted leader election
+  - `pow.rs`: transaction PoW hashing/verification
+- `src/core/`
+  - `transaction.rs`: signed tx model + zero-copy decode path
+  - `mempool.rs`: admission controls, TTL pruning, rate limits
+  - `block.rs`: block/header serialization + integrity checks
+  - `state.rs`: account state machine and block application
+  - `fork_choice.rs`: deterministic branch selection + reconciliation
+  - `sync.rs`: snapshot/chunk/checkpoint verification and import
+  - `recovery.rs`: crash-safe snapshot/WAL commit and recovery
+  - `genesis.rs`: deterministic genesis allocations and forging
+- `src/network/`
+  - `p2p.rs`: libp2p transport, gossip topics, sync wire messages
+  - `sync_engine.rs`: chunk scheduling, serve limiting, session state, persistence hooks
+  - `reputation.rs`: peer scoring and adaptive penalties
+  - `checkpoint_rotation.rs`: trusted-checkpoint-set rotation manager
+- `src/observability/`
+  - structured counters/events (`slot_miss`, `gossip_failure`, `sync_lag`)
+- `src/wallet/`
+  - CLI key management and tx send/broadcast
+- `tests/`
+  - integration chaos tests and deterministic partition fuzz harness
+- `fuzz/`
+  - `cargo-fuzz` target for untrusted gossip transaction payload decoding
+
+## Build and Toolchain
+
+Minimum toolchain from `Cargo.toml`:
+
+- Rust `1.85+`
+- Edition `2024`
+
+Build:
+
+```bash
+cargo build
+```
+
+Run all tests:
+
+```bash
+cargo test --workspace --all-targets
+```
+
+Run strict lint gate:
+
+```bash
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+```
+
+Format:
+
+```bash
+cargo fmt --all
+```
+
+## Wallet CLI (`homa-cli`)
+
+The binary entrypoint is `homa-cli`.
+
+Show help:
+
+```bash
+cargo run --bin homa-cli -- --help
+cargo run --bin homa-cli -- keys --help
+cargo run --bin homa-cli -- tx --help
+```
+
+### 1) Generate an encrypted wallet
+
+```bash
+cargo run --bin homa-cli -- keys generate --network testnet
+```
+
+Optional flags:
+
+- `--wallet-path <PATH>`
+- `--state-path <PATH>`
+- `--passphrase <VALUE>` (or `HOMA_WALLET_PASSPHRASE`)
+
+Defaults when not specified:
+
+- wallet file: `~/.homa/wallet.key`
+- local nonce state: `~/.homa/wallet_state.json`
+
+### 2) Send a transaction
+
+```bash
+cargo run --bin homa-cli -- tx send <RECEIVER_HMA_ADDRESS> 1.25 \
+  --network testnet \
+  --seed-domain seed1.homanetwork.io \
+  --broadcast-timeout-ms 8000
+```
+
+Useful options:
+
+- `--nonce <N>` override local nonce
+- `--fee-micro <U64>` fee in micro-homa (default `1`)
+- `--min-pow-bits <U16>` minimum required PoW bits (default `10`)
+- `--pow-time-ms <U64>` local PoW solve target duration (default `1500`)
+- `--fallback-bootstrap <ENTRY>` repeatable; accepts `IP`, `IP:PORT`, or full multiaddr
+
+Amount format:
+
+- accepts HMA decimal strings with up to 8 decimals
+- examples: `12`, `0.125`, `1.00000001`
+
+## Security Model (Current)
+
+- Wallet private keys are encrypted at rest:
+  - key derivation: `Argon2`
+  - encryption: `ChaCha20Poly1305`
+- Wallet and state files are written with secure file mode on Unix (`0600`).
+- Transactions include sender public key and enforce sender-address authority binding.
+- Transaction signatures are network-domain bound.
+- Snapshot checkpoint signatures enforce trusted-validator thresholds.
+- Rotation updates for trusted checkpoint sets require signatures from currently active trusted validators.
+
+## Networking and Sync Notes
+
+Current gossip topics:
+
+- `transactions`
+- `blocks`
+- `sync-requests`
+- `sync-chunks`
+
+Sync transport includes:
+
+- bounded encode/decode for request/response envelopes
+- malformed/oversized payload rejection
+- retry-aware outbound chunk scheduler
+- serve-side peer quota limiter
+- per-session/per-peer in-flight windows with deterministic backoff
+- optional strict checkpoint-aware handshake validation
+- persisted sync-session checkpoint state for restart continuity
+
+## Testing and Fuzzing
+
+### Integration and chaos tests
+
+```bash
+cargo test --workspace --all-targets
+```
+
+Includes:
+
+- delayed-link convergence checks
+- temporary partition reconcile checks
+- deterministic seed-replay partition chaos fuzzer
+
+### Fuzz target (network decode boundary)
+
+```bash
+cargo install cargo-fuzz
+cd fuzz
+cargo fuzz run gossipsub_tx_payload -- -max_total_time=60
+```
+
+The fuzz target continuously feeds malformed/random bytes into the transaction gossip decode boundary.
+
+## Architecture Plan and Tracker
+
+The active architecture + implementation tracker is:
+
+- `Homa_Architecture_and_Implementation_Plan.md`
+
+This document is used as the project’s living phase/task source of truth.
+
+## Development Principles in This Repo
+
+- `unsafe` is forbidden by lint policy.
+- Warnings are denied in CI-style workflows.
+- Clippy `all` + `pedantic` are enabled and enforced.
+- Typed error enums are preferred across modules.
+- Deterministic serialization and validation boundaries are emphasized for untrusted network input.
+
+## Contributing
+
+1. Fork and create a feature branch.
+2. Make changes with focused commits.
+3. Run the full quality gate locally:
+
+```bash
+cargo fmt --all
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-targets
+```
+
+4. Open a PR with:
+- problem statement
+- design summary
+- test evidence
+- migration/compatibility notes (if applicable)
+
+## License
+
+Licensed under Apache-2.0.
