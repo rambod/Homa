@@ -18,7 +18,7 @@ Implemented in this repository today:
 - snapshot fast-sync with checkpoint verification and anti-rollback protections
 - P2P transport and sync wire codecs
 - peer reputation, adaptive penalties, and checkpoint-trust rotation logic
-- node daemon skeleton with runtime loop wiring (`src/node/daemon.rs`)
+- node daemon runtime loop wiring with bounded pending-block finalization
 - wallet CLI for key generation and transaction broadcasting
 - deterministic chaos and fuzz testing harnesses
 
@@ -67,7 +67,8 @@ Not implemented yet (production gaps):
   - `reputation.rs`: peer scoring and adaptive penalties
   - `checkpoint_rotation.rs`: trusted-checkpoint-set rotation manager
 - `src/node/`
-  - `daemon.rs`: daemon skeleton integrating inbound runtime loop, mempool, sync maintenance, and swarm polling
+  - `daemon.rs`: daemon runtime integrating inbound runtime loop, mempool, pending-block finalization, sync maintenance, and swarm polling
+  - `config.rs`: typed `node.toml` config loading and startup validation
   - `cli.rs`: node daemon command-line entrypoint
 - `src/observability/`
   - structured counters/events (`slot_miss`, `gossip_failure`, `sync_lag`)
@@ -107,6 +108,12 @@ Format:
 
 ```bash
 cargo fmt --all
+```
+
+Full pre-release gate:
+
+```bash
+bash scripts/release_gate.sh
 ```
 
 ## Wallet CLI (`homa-cli`)
@@ -171,6 +178,13 @@ cargo run --bin homa-node -- --help
 cargo run --bin homa-node -- run --help
 ```
 
+Run from config file:
+
+```bash
+cp node.toml.example node.toml
+cargo run --bin homa-node -- run --config node.toml
+```
+
 Run node daemon with bounded smoke steps (recommended for first run):
 
 ```bash
@@ -191,6 +205,7 @@ cargo run --bin homa-node -- run \
 
 Useful options:
 
+- `--config <PATH>` load runtime settings from `node.toml`
 - `--no-listen` skip opening local listen sockets
 - `--no-bootstrap` skip DNS/fallback bootstrap dial attempts
 - `--strict-bootstrap` fail startup if bootstrap cannot dial
@@ -198,6 +213,14 @@ Useful options:
 - `--min-pow-bits <U16>` mempool admission PoW floor
 - `--max-pending-blocks <USIZE>` pending decoded block queue bound
 - `--max-steps <USIZE>` bounded event-loop steps for smoke/automation
+- `--state-directory <PATH>` enable graceful shutdown persistence flush (state snapshot + sync checkpoint)
+
+Runtime behavior notes:
+
+- each maintenance tick processes timeout/retry feedback, then attempts bounded pending-block finalization
+- pending blocks are finalized only when height and parent hash match the current finalized tip
+- invalid/stale blocks are rejected; out-of-order future blocks are retained until parent blocks arrive
+- transactions included in finalized blocks are evicted from mempool
 
 ## Security Model (Current)
 
@@ -243,15 +266,21 @@ Includes:
 - temporary partition reconcile checks
 - deterministic seed-replay partition chaos fuzzer
 
-### Fuzz target (network decode boundary)
+### Fuzz targets (network decode boundaries)
 
 ```bash
 cargo install cargo-fuzz
 cd fuzz
 cargo +nightly fuzz run gossipsub_tx_payload -- -max_total_time=60
+cargo +nightly fuzz run block_payload -- -max_total_time=60
+cargo +nightly fuzz run sync_chunk_payload -- -max_total_time=60
 ```
 
-The fuzz target continuously feeds malformed/random bytes into the transaction gossip decode boundary.
+Targets:
+
+- `gossipsub_tx_payload`: transaction gossip decode boundary
+- `block_payload`: block gossip payload bound + decode/validation path
+- `sync_chunk_payload`: sync wire/chunk decode path
 
 ## Architecture Plan and Tracker
 
@@ -276,9 +305,7 @@ This document is used as the project’s living phase/task source of truth.
 3. Run the full quality gate locally:
 
 ```bash
-cargo fmt --all
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-targets
+bash scripts/release_gate.sh
 ```
 
 4. Open a PR with:

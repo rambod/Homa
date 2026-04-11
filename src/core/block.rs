@@ -10,6 +10,8 @@ use crate::crypto::keys::SIGNATURE_LENGTH;
 pub const HASH_LENGTH: usize = 32;
 /// Current block-header version.
 pub const BLOCK_VERSION: u16 = 1;
+/// Upper bound for encoded block bytes accepted during decode.
+pub const MAX_BLOCK_BYTES: usize = 4 * 1024 * 1024;
 
 /// Fixed-size 32-byte block hash.
 pub type BlockHash = [u8; HASH_LENGTH];
@@ -157,7 +159,8 @@ impl Block {
             bytes,
             bincode::config::standard()
                 .with_fixed_int_encoding()
-                .with_little_endian(),
+                .with_little_endian()
+                .with_limit::<MAX_BLOCK_BYTES>(),
         )
         .map(|(block, _)| block)
         .map_err(|_| BlockError::Deserialization)
@@ -339,6 +342,22 @@ mod tests {
             block,
             decoded.unwrap_or_else(|_| unreachable!()),
             "block should roundtrip through binary codec"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_malicious_length_prefix_payload() {
+        let payload = [
+            34, 17, 0, 0, 0, 0, 0, 0, 0, 34, 34, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 76, 76, 76, 16,
+        ];
+        let decoded = Block::decode(&payload);
+        assert!(
+            matches!(decoded, Err(BlockError::Deserialization)),
+            "malicious payload should fail decode without oversized allocation"
         );
     }
 }

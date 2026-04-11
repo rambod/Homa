@@ -1,6 +1,7 @@
 //! Node daemon skeleton and runtime event-loop wiring.
 
 use std::collections::VecDeque;
+use std::path::Path;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -12,7 +13,8 @@ use thiserror::Error;
 
 use crate::core::block::{Block, BlockError};
 use crate::core::genesis::{GenesisError, default_genesis_allocations, forge_genesis};
-use crate::core::mempool::{Mempool, MempoolConfig, MempoolError, TransactionId};
+use crate::core::mempool::{Mempool, MempoolConfig, MempoolError, TransactionId, transaction_id};
+use crate::core::recovery::{RecoveryError, RecoveryPaths, commit_state_snapshot_atomic};
 use crate::core::state::ChainState;
 use crate::core::sync::{SnapshotAdmissionPolicy, SnapshotImportMode};
 use crate::crypto::address::Network;
@@ -31,6 +33,9 @@ use crate::network::runtime_loop::{
 };
 use crate::network::runtime_policy::{RuntimePolicyError, SyncRuntimePolicyController};
 use crate::network::sync_engine::{ChunkServePolicy, ChunkSessionPolicy, RequestSchedulerPolicy};
+use crate::network::sync_engine::{
+    SyncEngineError, SyncSessionCheckpointPaths, persist_sync_runtime_checkpoint,
+};
 use crate::network::sync_runtime::{
     SnapshotImportFailurePolicy, SyncRuntimeCoordinator, SyncRuntimeError,
 };
@@ -155,6 +160,10 @@ pub struct NodeRuntimeStats {
     pub tx_rejected_total: u64,
     /// Number of decoded blocks queued for downstream processing.
     pub blocks_queued_total: u64,
+    /// Number of pending blocks finalized into chain state.
+    pub blocks_finalized_total: u64,
+    /// Number of pending blocks rejected during finalization checks.
+    pub block_rejected_total: u64,
     /// Number of pending-block queue evictions due to capacity bound.
     pub pending_block_evictions_total: u64,
     /// Number of accepted sync chunk requests.
@@ -178,6 +187,10 @@ pub struct NodeMaintenanceReport {
     pub retried_requests: usize,
     /// Number of timeout-exhausted entries observed this tick.
     pub exhausted_requests: usize,
+    /// Number of pending blocks finalized this tick.
+    pub finalized_blocks: usize,
+    /// Number of pending blocks rejected this tick.
+    pub rejected_blocks: usize,
     /// Number of snapshots imported this tick.
     pub imported_snapshots: usize,
     /// Number of snapshots quarantined this tick.
@@ -195,12 +208,33 @@ pub struct NodeEventLoopReport {
     pub processed_gossip_messages: usize,
     /// Number of maintenance ticks executed due to poll timeout.
     pub maintenance_ticks: usize,
+    /// Number of pending blocks finalized during maintenance ticks.
+    pub finalized_blocks: usize,
+    /// Number of pending blocks rejected during maintenance ticks.
+    pub rejected_blocks: usize,
     /// Number of imported snapshots observed across ticks.
     pub imported_snapshots: usize,
     /// Number of quarantined snapshots observed across ticks.
     pub quarantined_snapshots: usize,
     /// Number of maintenance ticks that had blocked imports.
     pub blocked_import_events: usize,
+}
+
+/// Graceful-shutdown persistence report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodePersistenceReport {
+    /// Finalized block height used for snapshot persistence.
+    pub state_height: u64,
+    /// Number of encoded snapshot bytes written.
+    pub state_snapshot_bytes: usize,
+    /// Number of encoded sync checkpoint bytes written.
+    pub sync_checkpoint_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct NodePendingBlockProcessingReport {
+    finalized_blocks: usize,
+    rejected_blocks: usize,
 }
 
 impl NodeEventLoopReport {
@@ -214,6 +248,8 @@ impl NodeEventLoopReport {
         self.maintenance_ticks = self
             .maintenance_ticks
             .saturating_add(other.maintenance_ticks);
+        self.finalized_blocks = self.finalized_blocks.saturating_add(other.finalized_blocks);
+        self.rejected_blocks = self.rejected_blocks.saturating_add(other.rejected_blocks);
         self.imported_snapshots = self
             .imported_snapshots
             .saturating_add(other.imported_snapshots);
@@ -280,6 +316,12 @@ pub enum NodeDaemonError {
         /// Underlying block error.
         source: BlockError,
     },
+    /// Hashing current finalized block failed during pending-block processing.
+    #[error("node daemon finalized block hash computation failed: {source}")]
+    FinalizedBlockHash {
+        /// Underlying block hash error.
+        source: BlockError,
+    },
     /// Sync runtime maintenance operation failed.
     #[error("node daemon sync runtime maintenance failed: {source}")]
     SyncRuntime {
@@ -291,6 +333,18 @@ pub enum NodeDaemonError {
     Network {
         /// Underlying network error.
         source: NetworkError,
+    },
+    /// State snapshot persistence failed.
+    #[error("node daemon state persistence failed: {source}")]
+    Recovery {
+        /// Underlying state recovery/persistence error.
+        source: RecoveryError,
+    },
+    /// Sync-session checkpoint persistence failed.
+    #[error("node daemon sync checkpoint persistence failed: {source}")]
+    SyncCheckpoint {
+        /// Underlying sync-engine checkpoint error.
+        source: SyncEngineError,
     },
     /// Swarm-backed event loop was requested without attached swarm.
     #[error("node daemon has no attached swarm")]
@@ -579,6 +633,8 @@ impl NodeDaemon {
                 .record_peer_event(&exhausted.peer_id, ReputationEvent::Timeout, now_ms);
         }
 
+        let block_processing = self.process_pending_blocks(self.config.max_pending_blocks)?;
+
         let import_mode = SnapshotImportMode::SteadyState {
             local_finalized_height: self.finalized_block.header.height,
         };
@@ -605,6 +661,8 @@ impl NodeDaemon {
         Ok(NodeMaintenanceReport {
             retried_requests: timeout_feedback.retries.len(),
             exhausted_requests: timeout_feedback.exhausted.len(),
+            finalized_blocks: block_processing.finalized_blocks,
+            rejected_blocks: block_processing.rejected_blocks,
             imported_snapshots: batch.imported.len(),
             quarantined_snapshots: batch.quarantined.len(),
             blocked_import: batch.blocked,
@@ -663,6 +721,12 @@ impl NodeDaemon {
                 Err(_) => {
                     let maintenance = self.run_maintenance_tick_now()?;
                     report.maintenance_ticks = report.maintenance_ticks.saturating_add(1);
+                    report.finalized_blocks = report
+                        .finalized_blocks
+                        .saturating_add(maintenance.finalized_blocks);
+                    report.rejected_blocks = report
+                        .rejected_blocks
+                        .saturating_add(maintenance.rejected_blocks);
                     report.imported_snapshots = report
                         .imported_snapshots
                         .saturating_add(maintenance.imported_snapshots);
@@ -743,6 +807,34 @@ impl NodeDaemon {
         self.sync_runtime.completed_snapshot_count()
     }
 
+    /// Persists chain state and sync-session runtime checkpoints atomically during shutdown.
+    pub fn persist_runtime_state(
+        &self,
+        directory: &Path,
+    ) -> Result<NodePersistenceReport, NodeDaemonError> {
+        let recovery_paths = RecoveryPaths::new(directory.to_path_buf());
+        let state_commit = commit_state_snapshot_atomic(
+            &self.chain_state,
+            self.finalized_block.header.height,
+            &recovery_paths,
+        )
+        .map_err(|source| NodeDaemonError::Recovery { source })?;
+
+        let sync_paths = SyncSessionCheckpointPaths::new(directory.to_path_buf());
+        let sync_checkpoint_bytes = persist_sync_runtime_checkpoint(
+            self.sync_runtime.request_scheduler(),
+            self.sync_runtime.session_manager(),
+            &sync_paths,
+        )
+        .map_err(|source| NodeDaemonError::SyncCheckpoint { source })?;
+
+        Ok(NodePersistenceReport {
+            state_height: state_commit.block_height,
+            state_snapshot_bytes: state_commit.bytes_written,
+            sync_checkpoint_bytes,
+        })
+    }
+
     /// Returns current peer reputation score.
     #[must_use]
     pub fn peer_score(&self, peer_id: &str, now_ms: u64) -> i32 {
@@ -763,6 +855,108 @@ impl NodeDaemon {
     /// Pops oldest queued decoded block for downstream consensus execution.
     pub fn pop_pending_block(&mut self) -> Option<Block> {
         self.pending_blocks.pop_front()
+    }
+
+    fn process_pending_blocks(
+        &mut self,
+        max_blocks: usize,
+    ) -> Result<NodePendingBlockProcessingReport, NodeDaemonError> {
+        let mut report = NodePendingBlockProcessingReport::default();
+        let mut finalized_attempts = 0_usize;
+        let max_iterations = max_blocks.max(1);
+
+        while finalized_attempts < max_iterations {
+            let expected_height = self.finalized_block.header.height.saturating_add(1);
+
+            let stale_rejections = self
+                .drop_pending_blocks_by_predicate(|block| block.header.height < expected_height);
+            report.rejected_blocks = report.rejected_blocks.saturating_add(stale_rejections);
+            if stale_rejections > 0 {
+                continue;
+            }
+
+            let finalized_hash = self
+                .finalized_block
+                .hash()
+                .map_err(|source| NodeDaemonError::FinalizedBlockHash { source })?;
+
+            if let Some(index) = self.pending_blocks.iter().position(|block| {
+                block.header.height == expected_height
+                    && block.header.previous_block_hash == finalized_hash
+            }) {
+                let Some(candidate) = self.pending_blocks.remove(index) else {
+                    break;
+                };
+                finalized_attempts = finalized_attempts.saturating_add(1);
+                if self.try_finalize_pending_block(candidate) {
+                    report.finalized_blocks = report.finalized_blocks.saturating_add(1);
+                } else {
+                    report.rejected_blocks = report.rejected_blocks.saturating_add(1);
+                }
+                continue;
+            }
+
+            let parent_mismatch_rejections = self.drop_pending_blocks_by_predicate(|block| {
+                block.header.height == expected_height
+                    && block.header.previous_block_hash != finalized_hash
+            });
+            report.rejected_blocks = report
+                .rejected_blocks
+                .saturating_add(parent_mismatch_rejections);
+            if parent_mismatch_rejections > 0 {
+                continue;
+            }
+
+            break;
+        }
+
+        Ok(report)
+    }
+
+    fn try_finalize_pending_block(&mut self, block: Block) -> bool {
+        let mut next_state = self.chain_state.clone();
+        if next_state.apply_block(&block).is_err() {
+            self.stats.block_rejected_total = self.stats.block_rejected_total.saturating_add(1);
+            return false;
+        }
+
+        if next_state.state_root() != block.header.state_root {
+            self.stats.block_rejected_total = self.stats.block_rejected_total.saturating_add(1);
+            return false;
+        }
+
+        self.remove_included_transactions_from_mempool(&block);
+        self.chain_state = next_state;
+        self.finalized_block = block;
+        self.stats.blocks_finalized_total = self.stats.blocks_finalized_total.saturating_add(1);
+        true
+    }
+
+    fn remove_included_transactions_from_mempool(&mut self, block: &Block) {
+        for transaction in &block.transactions {
+            if let Ok(tx_id) = transaction_id(transaction) {
+                let _ = self.mempool.remove(&tx_id);
+            }
+        }
+    }
+
+    fn drop_pending_blocks_by_predicate<F>(&mut self, mut predicate: F) -> usize
+    where
+        F: FnMut(&Block) -> bool,
+    {
+        let mut dropped = 0_usize;
+        let mut index = 0_usize;
+        while index < self.pending_blocks.len() {
+            let should_drop = self.pending_blocks.get(index).is_some_and(&mut predicate);
+            if should_drop {
+                let _ = self.pending_blocks.remove(index);
+                dropped = dropped.saturating_add(1);
+                self.stats.block_rejected_total = self.stats.block_rejected_total.saturating_add(1);
+            } else {
+                index = index.saturating_add(1);
+            }
+        }
+        dropped
     }
 
     fn enqueue_pending_block(&mut self, block: Block) {
@@ -814,8 +1008,10 @@ mod tests {
         NodeDaemon, NodeDaemonConfig, NodeDaemonError, NodeInboundOutcome,
         trusted_checkpoint_set_from_genesis,
     };
+    use crate::core::block::{Block, BlockHeader};
     use crate::core::genesis::forge_genesis;
     use crate::core::mempool::MempoolConfig;
+    use crate::core::recovery::SNAPSHOT_FILE_NAME;
     use crate::core::sync::{build_state_snapshot, split_snapshot_into_chunks};
     use crate::core::transaction::Transaction;
     use crate::crypto::address::{Network, derive_address};
@@ -826,6 +1022,8 @@ mod tests {
         encode_snapshot_chunk_response,
     };
     use crate::network::runtime_loop::RuntimeLoopError;
+    use crate::network::sync_engine::SYNC_SESSION_CHECKPOINT_FILE_NAME;
+    use std::fs;
 
     fn daemon_with_low_pow(network: Network) -> NodeDaemon {
         let mut config = NodeDaemonConfig::for_network(network);
@@ -868,6 +1066,59 @@ mod tests {
         );
         unsigned
             .with_signature(sender_keypair.sign(&signing_bytes.unwrap_or_else(|_| unreachable!())))
+    }
+
+    fn genesis_sender(network: Network) -> (Keypair, String) {
+        let sender_secret = [1_u8; 32];
+        let sender_keypair = Keypair::from_secret_key(&sender_secret);
+        assert!(sender_keypair.is_ok(), "genesis sender key should parse");
+        let sender_keypair = sender_keypair.unwrap_or_else(|_| unreachable!());
+        let sender_address = derive_address(&sender_keypair.public_key_bytes(), network);
+        assert!(
+            sender_address.is_ok(),
+            "genesis sender address should derive"
+        );
+        (
+            sender_keypair,
+            sender_address.unwrap_or_else(|_| unreachable!()),
+        )
+    }
+
+    fn signed_transaction_from_genesis_sender(
+        network: Network,
+        nonce: u64,
+        amount: u64,
+        fee: u64,
+    ) -> Transaction {
+        let (sender_keypair, sender_address) = genesis_sender(network);
+        let receiver_keypair = Keypair::generate();
+        let receiver_address = derive_address(&receiver_keypair.public_key_bytes(), network);
+        assert!(receiver_address.is_ok(), "receiver address should derive");
+        let receiver_address = receiver_address.unwrap_or_else(|_| unreachable!());
+
+        let unsigned =
+            Transaction::new_unsigned(sender_address, receiver_address, amount, fee, nonce, 0)
+                .with_sender_public_key(sender_keypair.public_key_bytes());
+        let signing_bytes = unsigned.signing_bytes_for_network(network);
+        assert!(signing_bytes.is_ok(), "signing bytes should build");
+
+        unsigned
+            .with_signature(sender_keypair.sign(&signing_bytes.unwrap_or_else(|_| unreachable!())))
+    }
+
+    fn empty_child_block(parent: &Block, state_root: [u8; 32], proposer: String) -> Block {
+        let parent_hash = parent.hash();
+        assert!(parent_hash.is_ok(), "parent hash should compute");
+        let header = BlockHeader::new(
+            parent.header.height.saturating_add(1),
+            parent_hash.unwrap_or_else(|_| unreachable!()),
+            state_root,
+            parent.header.timestamp_unix_ms.saturating_add(1),
+            proposer,
+        );
+        let block = Block::new_unsigned(header, Vec::new());
+        assert!(block.is_ok(), "empty child block should build");
+        block.unwrap_or_else(|_| unreachable!())
     }
 
     #[test]
@@ -984,6 +1235,183 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_tick_finalizes_valid_pending_block() {
+        let network = Network::Testnet;
+        let mut daemon = daemon_with_low_pow(network);
+
+        let block = empty_child_block(
+            daemon.finalized_block(),
+            daemon.chain_state().state_root(),
+            daemon.finalized_block().header.proposer.clone(),
+        );
+        let payload = block.encode();
+        assert!(payload.is_ok(), "block should encode");
+        let handled = daemon.handle_inbound_gossip_message(
+            BLOCKS_TOPIC,
+            &payload.unwrap_or_else(|_| unreachable!()),
+            "peer-block-good",
+            24_000,
+        );
+        assert!(
+            matches!(handled, Ok(NodeInboundOutcome::BlockQueued { height: 1 })),
+            "valid block payload should queue"
+        );
+
+        let report = daemon.run_maintenance_tick(24_100);
+        assert!(report.is_ok(), "maintenance should run");
+        let report = report.unwrap_or_else(|_| unreachable!());
+        assert_eq!(report.finalized_blocks, 1);
+        assert_eq!(report.rejected_blocks, 0);
+        assert_eq!(daemon.finalized_block().header.height, 1);
+        assert_eq!(daemon.pending_block_count(), 0);
+        assert_eq!(daemon.stats().blocks_finalized_total, 1);
+        assert_eq!(daemon.stats().block_rejected_total, 0);
+    }
+
+    #[test]
+    fn maintenance_tick_rejects_block_with_state_root_mismatch() {
+        let network = Network::Testnet;
+        let mut daemon = daemon_with_low_pow(network);
+
+        let mut invalid_block = empty_child_block(
+            daemon.finalized_block(),
+            daemon.chain_state().state_root(),
+            daemon.finalized_block().header.proposer.clone(),
+        );
+        invalid_block.header.state_root = [7_u8; 32];
+        let payload = invalid_block.encode();
+        assert!(payload.is_ok(), "invalid block payload should encode");
+
+        let queued = daemon.handle_inbound_gossip_message(
+            BLOCKS_TOPIC,
+            &payload.unwrap_or_else(|_| unreachable!()),
+            "peer-block-bad-root",
+            25_000,
+        );
+        assert!(queued.is_ok(), "invalid-root block should still queue");
+
+        let report = daemon.run_maintenance_tick(25_100);
+        assert!(report.is_ok(), "maintenance should run");
+        let report = report.unwrap_or_else(|_| unreachable!());
+        assert_eq!(report.finalized_blocks, 0);
+        assert_eq!(report.rejected_blocks, 1);
+        assert_eq!(daemon.finalized_block().header.height, 0);
+        assert_eq!(daemon.pending_block_count(), 0);
+        assert_eq!(daemon.stats().blocks_finalized_total, 0);
+        assert_eq!(daemon.stats().block_rejected_total, 1);
+    }
+
+    #[test]
+    fn maintenance_tick_keeps_future_block_until_parent_arrives() {
+        let network = Network::Testnet;
+        let mut daemon = daemon_with_low_pow(network);
+        let block_one = empty_child_block(
+            daemon.finalized_block(),
+            daemon.chain_state().state_root(),
+            daemon.finalized_block().header.proposer.clone(),
+        );
+        let block_two = empty_child_block(
+            &block_one,
+            daemon.chain_state().state_root(),
+            daemon.finalized_block().header.proposer.clone(),
+        );
+
+        let block_two_payload = block_two.encode();
+        assert!(block_two_payload.is_ok(), "block two should encode");
+        let queued_block_two = daemon.handle_inbound_gossip_message(
+            BLOCKS_TOPIC,
+            &block_two_payload.unwrap_or_else(|_| unreachable!()),
+            "peer-future",
+            26_000,
+        );
+        assert!(queued_block_two.is_ok(), "future block should queue");
+
+        let first_report = daemon.run_maintenance_tick(26_100);
+        assert!(first_report.is_ok(), "maintenance should run");
+        let first_report = first_report.unwrap_or_else(|_| unreachable!());
+        assert_eq!(first_report.finalized_blocks, 0);
+        assert_eq!(first_report.rejected_blocks, 0);
+        assert_eq!(daemon.pending_block_count(), 1);
+        assert_eq!(daemon.finalized_block().header.height, 0);
+
+        let block_one_payload = block_one.encode();
+        assert!(block_one_payload.is_ok(), "block one should encode");
+        let queued_block_one = daemon.handle_inbound_gossip_message(
+            BLOCKS_TOPIC,
+            &block_one_payload.unwrap_or_else(|_| unreachable!()),
+            "peer-parent",
+            26_200,
+        );
+        assert!(queued_block_one.is_ok(), "parent block should queue");
+
+        let second_report = daemon.run_maintenance_tick(26_300);
+        assert!(second_report.is_ok(), "maintenance should run");
+        let second_report = second_report.unwrap_or_else(|_| unreachable!());
+        assert_eq!(second_report.finalized_blocks, 2);
+        assert_eq!(second_report.rejected_blocks, 0);
+        assert_eq!(daemon.finalized_block().header.height, 2);
+        assert_eq!(daemon.pending_block_count(), 0);
+        assert_eq!(daemon.stats().blocks_finalized_total, 2);
+    }
+
+    #[test]
+    fn finalizing_block_evicts_included_transactions_from_mempool() {
+        let network = Network::Testnet;
+        let mut daemon = daemon_with_low_pow(network);
+
+        let transaction = signed_transaction_from_genesis_sender(network, 1, 100, 2);
+        let tx_payload = transaction.encode();
+        assert!(tx_payload.is_ok(), "transaction should encode");
+        let tx_admission = daemon.handle_inbound_gossip_message(
+            TRANSACTIONS_TOPIC,
+            &tx_payload.unwrap_or_else(|_| unreachable!()),
+            "peer-tx-evict",
+            27_000,
+        );
+        assert!(tx_admission.is_ok(), "transaction should be admitted");
+        assert_eq!(daemon.mempool_len(), 1);
+
+        let header = BlockHeader::new(
+            1,
+            daemon
+                .finalized_block()
+                .hash()
+                .unwrap_or_else(|_| unreachable!()),
+            [0_u8; 32],
+            daemon
+                .finalized_block()
+                .header
+                .timestamp_unix_ms
+                .saturating_add(1),
+            daemon.finalized_block().header.proposer.clone(),
+        );
+        let block = Block::new_unsigned(header, vec![transaction]);
+        assert!(block.is_ok(), "block should build");
+        let mut block = block.unwrap_or_else(|_| unreachable!());
+        let mut post_state = daemon.chain_state().clone();
+        let applied = post_state.apply_block(&block);
+        assert!(applied.is_ok(), "block transition should apply");
+        block.header.state_root = post_state.state_root();
+
+        let block_payload = block.encode();
+        assert!(block_payload.is_ok(), "block should encode");
+        let block_queued = daemon.handle_inbound_gossip_message(
+            BLOCKS_TOPIC,
+            &block_payload.unwrap_or_else(|_| unreachable!()),
+            "peer-block-evict",
+            27_100,
+        );
+        assert!(block_queued.is_ok(), "block should queue");
+
+        let report = daemon.run_maintenance_tick(27_200);
+        assert!(report.is_ok(), "maintenance should run");
+        let report = report.unwrap_or_else(|_| unreachable!());
+        assert_eq!(report.finalized_blocks, 1);
+        assert_eq!(daemon.mempool_len(), 0);
+        assert_eq!(daemon.finalized_block().header.height, 1);
+    }
+
+    #[test]
     fn maintenance_tick_imports_completed_snapshot_and_updates_observability() {
         let network = Network::Testnet;
         let mut daemon = daemon_with_low_pow(network);
@@ -1036,6 +1464,8 @@ mod tests {
         assert!(report.is_ok(), "maintenance tick should run");
         let report = report.unwrap_or_else(|_| unreachable!());
 
+        assert_eq!(report.finalized_blocks, 0);
+        assert_eq!(report.rejected_blocks, 0);
         assert_eq!(report.imported_snapshots, 1);
         assert_eq!(report.quarantined_snapshots, 0);
         assert!(report.blocked_import.is_none());
@@ -1050,6 +1480,49 @@ mod tests {
         assert!(
             matches!(result, Err(NodeDaemonError::MissingSwarm)),
             "event loop should reject execution without attached swarm"
+        );
+    }
+
+    #[test]
+    fn persist_runtime_state_flushes_state_and_sync_checkpoint() {
+        let daemon = daemon_with_low_pow(Network::Testnet);
+        let mut directory = std::env::temp_dir();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0_u128, |duration| duration.as_nanos());
+        directory.push(format!(
+            "homa-daemon-persist-{}-{unique}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+
+        let persisted = daemon.persist_runtime_state(&directory);
+        assert!(
+            persisted.is_ok(),
+            "runtime state persistence should succeed"
+        );
+        let persisted = persisted.unwrap_or_else(|_| unreachable!());
+        assert!(
+            persisted.state_snapshot_bytes > 0,
+            "state snapshot persistence should report encoded bytes"
+        );
+        assert!(
+            persisted.sync_checkpoint_bytes > 0,
+            "sync checkpoint persistence should report encoded bytes"
+        );
+
+        let snapshot_path = directory.join(SNAPSHOT_FILE_NAME);
+        let sync_path = directory.join(SYNC_SESSION_CHECKPOINT_FILE_NAME);
+        assert!(
+            snapshot_path.exists(),
+            "state snapshot file should be written"
+        );
+        assert!(sync_path.exists(), "sync checkpoint file should be written");
+
+        let cleanup = fs::remove_dir_all(&directory);
+        assert!(
+            cleanup.is_ok(),
+            "test persistence directory should clean up"
         );
     }
 }

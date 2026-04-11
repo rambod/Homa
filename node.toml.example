@@ -1,0 +1,11 @@
+network = "testnet"
+seed_domain = "seed1.homanetwork.io"
+fallback_bootstrap = []
+listen = true
+bootstrap = true
+strict_bootstrap = false
+min_pow_bits = 10
+event_loop_tick_ms = 250
+max_pending_blocks = 512
+# max_steps = 10
+# state_directory = "state/node-1"

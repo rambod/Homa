@@ -19,3 +19,17 @@ path = "fuzz_targets/gossipsub_tx_payload.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "block_payload"
+path = "fuzz_targets/block_payload.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sync_chunk_payload"
+path = "fuzz_targets/sync_chunk_payload.rs"
+test = false
+doc = false
+bench = false

@@ -625,3 +625,41 @@ fn partition_chaos_fuzzer_converges_across_seed_matrix() {
         );
     }
 }
+
+#[test]
+fn partition_chaos_soak_meets_operational_slos() {
+    let seeds = [11_u64, 29_u64, 101_u64];
+    let slots = 180_u64;
+    for seed in seeds {
+        let summary = simulate_partition_chaos(seed, slots);
+        let produced_total = summary.produced_on_a.saturating_add(summary.produced_on_b);
+
+        assert_eq!(
+            summary.final_sync_lag, 0,
+            "soak run must converge to zero lag (seed={seed})"
+        );
+        assert!(
+            summary.final_height >= (slots / 3),
+            "winning branch should retain sufficient throughput under soak load (seed={seed})"
+        );
+        assert!(
+            summary.max_observed_lag >= 1,
+            "partition window should manifest non-zero lag before reconciliation (seed={seed})"
+        );
+        assert!(
+            summary
+                .delivered_to_c
+                .saturating_add(summary.dropped_before_delivery)
+                > 0,
+            "soak run should exercise delivery/drop paths before reconciliation (seed={seed})"
+        );
+        assert!(
+            summary.produced_on_a > 0 && summary.produced_on_b > 0,
+            "soak run should produce blocks on both fork branches (seed={seed})"
+        );
+        assert!(
+            summary.rejected_on_delivery <= produced_total,
+            "rejected deliveries should stay bounded by produced traffic volume (seed={seed})"
+        );
+    }
+}

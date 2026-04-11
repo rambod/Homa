@@ -21,6 +21,7 @@ use libp2p::{Multiaddr, PeerId, StreamProtocol, SwarmBuilder, noise, tcp, yamux}
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::core::block::MAX_BLOCK_BYTES;
 use crate::core::sync::SnapshotChunk;
 use crate::core::transaction::{
     BorrowedTransaction, MAX_TRANSACTION_BYTES, Transaction, TransactionError,
@@ -38,7 +39,7 @@ pub const SYNC_CHUNKS_TOPIC: &str = "sync-chunks";
 /// Gossipsub topic for checkpoint trust-set rotation updates.
 pub const CHECKPOINT_ROTATIONS_TOPIC: &str = "checkpoint-rotations";
 /// Upper bound for inbound block gossip payload size in bytes.
-pub const MAX_BLOCK_GOSSIP_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_BLOCK_GOSSIP_BYTES: usize = MAX_BLOCK_BYTES;
 /// Default TCP port used for bootstrapping when DNS only returns plain IP addresses.
 pub const DEFAULT_BOOTSTRAP_TCP_PORT: u16 = 7000;
 /// Default QUIC port used for bootstrapping when DNS only returns plain IP addresses.
@@ -417,7 +418,8 @@ pub fn decode_sync_wire_message(payload: &[u8]) -> Result<SyncWireMessage, Netwo
         payload,
         bincode::config::standard()
             .with_fixed_int_encoding()
-            .with_little_endian(),
+            .with_little_endian()
+            .with_limit::<MAX_SYNC_WIRE_MESSAGE_BYTES>(),
     )
     .map(|(message, _)| message)
     .map_err(|_| NetworkError::MalformedSyncPayload)
@@ -981,6 +983,22 @@ mod tests {
         assert!(
             matches!(decoded, Err(NetworkError::MalformedSyncPayload)),
             "malformed sync payload should return typed decode error"
+        );
+    }
+
+    #[test]
+    fn malformed_sync_payload_with_malicious_length_prefix_is_rejected() {
+        let payload = [
+            1, 0, 0, 0, 0, 0, 0, 0, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38,
+            253, 255, 255, 255, 255, 116, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 0, 0, 0,
+            38, 255, 255, 0, 0, 0, 0, 0, 0, 194, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255,
+            255, 38, 0, 0, 116, 116, 255, 255, 255, 255, 255, 169, 255, 255, 255, 247, 255, 116, 0,
+            0, 0, 126, 126, 126, 126, 126, 126, 37, 116, 3, 7,
+        ];
+        let decoded = decode_sync_wire_message(&payload);
+        assert!(
+            matches!(decoded, Err(NetworkError::MalformedSyncPayload)),
+            "malicious length prefixes should fail bounded sync decode without panic"
         );
     }
 

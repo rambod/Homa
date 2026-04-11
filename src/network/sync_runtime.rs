@@ -614,6 +614,18 @@ impl SyncRuntimeCoordinator {
         self.session_manager.peer_in_flight_count(peer_id)
     }
 
+    /// Returns immutable access to the underlying request scheduler.
+    #[must_use]
+    pub const fn request_scheduler(&self) -> &ChunkRequestScheduler {
+        &self.scheduler
+    }
+
+    /// Returns immutable access to the underlying session manager.
+    #[must_use]
+    pub const fn session_manager(&self) -> &ChunkSessionManager {
+        &self.session_manager
+    }
+
     /// Returns number of active snapshot stream assemblers.
     #[must_use]
     pub fn active_assembly_stream_count(&self) -> usize {

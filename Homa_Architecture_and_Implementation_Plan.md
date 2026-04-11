@@ -369,3 +369,34 @@ Close the gap between daemon library primitives and an executable operator-facin
 - [x] **Expansion:** Extended `src/node/daemon.rs` with `from_genesis_with_config(...)`, `run_until_ctrl_c(...)`, peer reputation introspection helpers, and report aggregation utilities.
 - [x] **Expansion:** Updated `README.md` with node daemon usage (`homa-node run`) and nightly fuzz invocation guidance.
 - [x] **Expansion:** Updated `NodeCliError` and `NodeDaemonError` display strings to include source error chains, and added a CLI regression test to prevent diagnostic regressions.
+
+---
+
+## 23. Phase 22: Production Security & Release Gates (Expansion V16)
+
+Move from pre-alpha feature wiring toward repeatable production-readiness checks with explicit release gates and shutdown persistence safeguards.
+
+### Task List
+- [x] **Supply-Chain Security Gates:** Add `cargo-audit` + `cargo-deny` checks and enforce them in CI.
+- [x] **Additional Fuzz Targets:** Add fuzz targets for block gossip decode path and sync chunk decode path.
+- [x] **Long-Run Soak Test with SLOs:** Add deterministic multi-seed partition-chaos soak coverage with explicit convergence and delivery SLO assertions.
+- [x] **Persistent Runtime Config File:** Add typed `node.toml` runtime config loading/validation with CLI override composition.
+- [x] **Graceful Shutdown Persistence Check:** Flush chain snapshot + sync-session checkpoint to disk on shutdown path when state directory is configured.
+- [x] **One-Command Release Gate:** Add a release gate script that runs format/lint/tests/security checks and fuzz smoke runs.
+- [x] **Expansion:** Added `.github/workflows/release-gates.yml`, `deny.toml`, `scripts/release_gate.sh`, `node.toml.example`, `src/node/config.rs`, and new config/daemon/soak/fuzz test coverage.
+
+---
+
+## 24. Phase 23: Pending Block Finalization Pipeline (Expansion V17)
+
+Close the runtime execution gap by moving queued inbound blocks through deterministic state transition and finalized-tip advancement.
+
+### Task List
+- [x] **Maintenance-Tick Block Finalization:** Execute queued pending blocks during maintenance ticks with deterministic parent/height admission checks against the current finalized tip.
+- [x] **State-Root Enforcement:** Apply candidate blocks on a cloned `ChainState` and reject any block whose computed post-state root does not equal `header.state_root`.
+- [x] **Out-of-Order Queue Safety:** Retain future-height blocks until parents arrive, while dropping stale and parent-mismatch blocks so invalid queue heads cannot stall progression.
+- [x] **Mempool Inclusion Eviction:** Remove transactions included in finalized blocks from mempool to prevent stale duplicate nonce/fee contention.
+- [x] **Runtime Reporting Expansion:** Extend daemon runtime stats and event-loop/CLI reporting with finalized/rejected block counters.
+- [x] **Expansion:** Updated `src/node/daemon.rs` with pending-block processing (`process_pending_blocks`, `try_finalize_pending_block`, queue-drop helpers), new counters (`blocks_finalized_total`, `block_rejected_total`), and maintenance/event-loop report fields for finalized/rejected block totals.
+- [x] **Expansion:** Updated `src/node/cli.rs` report output to include finalized/rejected block maintenance counters and cumulative block execution stats.
+- [x] **Expansion:** Added daemon regression tests for valid finalization, state-root mismatch rejection, out-of-order future-block retention/unblocking, and mempool eviction for finalized block transactions.
