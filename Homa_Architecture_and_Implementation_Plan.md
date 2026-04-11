@@ -334,3 +334,38 @@ Promote snapshot import from single-step APIs to runtime batch orchestration wit
 - [x] **Expansion:** Updated `src/network/sync_runtime.rs` with `SnapshotImportBatchOutcome`, batch import APIs (`import_completed_snapshot_batch`, `import_completed_snapshot_batch_with_checkpoint`), import-outcome observability wiring, and enriched `SyncRuntimeError::{SnapshotImport, SnapshotImportQuarantined}` metadata.
 - [x] **Expansion:** Updated `src/observability/mod.rs` with new counters (`snapshot_import_success_total`, `snapshot_import_failure_total`, `snapshot_quarantine_total`), `SnapshotImportOutcome`, and `ObservabilityEventKind::SnapshotImport`.
 - [x] **Expansion:** Added tests in `src/network/sync_runtime.rs` for batch progression after quarantine and batch stop behavior on retryable failures, plus new observability lifecycle coverage in `src/observability/mod.rs`.
+
+---
+
+## 21. Phase 20: Node Daemon Skeleton & Runtime Event Loop Wiring (Expansion V14)
+
+Establish a long-running node daemon surface that composes networking, inbound runtime policy enforcement, sync maintenance, and state/mempool orchestration.
+
+### Task List
+- [x] **Node Runtime Module:** Add a dedicated node daemon module to host long-running runtime orchestration logic.
+- [x] **Inbound Gossip-to-State Wiring:** Route inbound gossip tuples through runtime-loop policy gates and wire accepted transactions into mempool admission with peer-penalty feedback on rejection.
+- [x] **Block Payload Queue Guardrail:** Decode/validate inbound block payloads and queue them into a bounded pending-block queue for downstream consensus processing.
+- [x] **Sync Maintenance Tick:** Add deterministic maintenance tick API that applies timeout->reputation feedback and drives completed snapshot batch import with observability emission.
+- [x] **Swarm Event Loop Skeleton:** Add bounded async swarm event-loop runner that interleaves inbound message handling and maintenance ticks.
+- [x] **Bootstrap/Listen Wiring:** Add daemon helpers to attach/build swarm, open default listen sockets, and dial DNS/fallback bootstrap peers.
+- [x] **Expansion:** Added `src/node/daemon.rs` and `src/node/mod.rs` with `NodeDaemon`, `NodeDaemonConfig`, typed daemon/runtime reports/errors, genesis bootstrap helpers (`from_genesis`, `trusted_checkpoint_set_from_genesis`), inbound action mapping, and bounded pending-block/mempool/snapshot orchestration.
+- [x] **Expansion:** Exported daemon module via `src/lib.rs` (`pub mod node`) and added focused daemon tests for genesis bootstrap, transaction admission path, completed-snapshot maintenance import path, and missing-swarm event-loop guard behavior.
+
+---
+
+## 22. Phase 21: Executable Node Lifecycle & Security Regression Hardening (Expansion V15)
+
+Close the gap between daemon library primitives and an executable operator-facing node process with regression security checks.
+
+### Task List
+- [x] **Node Binary Target:** Add a dedicated `homa-node` Cargo binary target and executable entrypoint.
+- [x] **Node Run CLI Surface:** Add node runtime CLI (`run`) with network selection, bootstrap/listen controls, bounded smoke-step mode, and runtime policy knobs.
+- [x] **Ctrl+C Lifecycle Loop:** Add daemon lifecycle API for continuous swarm loop execution until explicit OS signal shutdown.
+- [x] **Config-Bootstrap Constructor:** Add config-aware genesis bootstrap constructor to instantiate daemon from explicit runtime policy values.
+- [x] **Daemon Security Regression Tests:** Add daemon-level adversarial tests for malformed transaction payloads, unknown topics, and oversized block gossip payload handling with expected peer penalties.
+- [x] **Fuzz Pentest Verification:** Run decode-boundary fuzz target on nightly toolchain (`gossipsub_tx_payload`) and verify no crash/panic findings in short bounded run.
+- [x] **Operational Error Transparency:** Ensure operator-facing node failures include chained root-cause context (not generic top-level errors) for faster incident triage.
+- [x] **Expansion:** Updated `Cargo.toml` with `homa-node` bin target and `tokio` signal feature, added `src/bin/homa-node.rs` and `src/node/cli.rs`, and wired node CLI execution from the shared library.
+- [x] **Expansion:** Extended `src/node/daemon.rs` with `from_genesis_with_config(...)`, `run_until_ctrl_c(...)`, peer reputation introspection helpers, and report aggregation utilities.
+- [x] **Expansion:** Updated `README.md` with node daemon usage (`homa-node run`) and nightly fuzz invocation guidance.
+- [x] **Expansion:** Updated `NodeCliError` and `NodeDaemonError` display strings to include source error chains, and added a CLI regression test to prevent diagnostic regressions.

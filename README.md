@@ -5,7 +5,7 @@ Homa is a pure Rust Layer-1 blockchain project implementing a hybrid model:
 - stake-weighted proposer selection (PoS side)
 - client-side proof-of-work per transaction (PoW side)
 
-This repository currently contains the protocol core, networking/sync hardening primitives, and a wallet CLI (`homa-cli`).
+This repository currently contains the protocol core, networking/sync hardening primitives, a node daemon CLI (`homa-node`), and a wallet CLI (`homa-cli`).
 
 ## Project Status
 
@@ -18,12 +18,13 @@ Implemented in this repository today:
 - snapshot fast-sync with checkpoint verification and anti-rollback protections
 - P2P transport and sync wire codecs
 - peer reputation, adaptive penalties, and checkpoint-trust rotation logic
+- node daemon skeleton with runtime loop wiring (`src/node/daemon.rs`)
 - wallet CLI for key generation and transaction broadcasting
 - deterministic chaos and fuzz testing harnesses
 
 Not implemented yet (production gaps):
 
-- full long-running node daemon
+- full production node-daemon lifecycle (current daemon is a pre-alpha skeleton)
 - RPC/REST/GraphQL APIs
 - persistent mempool/indexer pipeline
 - validator operations tooling and deployment automation
@@ -65,6 +66,9 @@ Not implemented yet (production gaps):
   - `sync_engine.rs`: chunk scheduling, serve limiting, session state, persistence hooks
   - `reputation.rs`: peer scoring and adaptive penalties
   - `checkpoint_rotation.rs`: trusted-checkpoint-set rotation manager
+- `src/node/`
+  - `daemon.rs`: daemon skeleton integrating inbound runtime loop, mempool, sync maintenance, and swarm polling
+  - `cli.rs`: node daemon command-line entrypoint
 - `src/observability/`
   - structured counters/events (`slot_miss`, `gossip_failure`, `sync_lag`)
 - `src/wallet/`
@@ -156,6 +160,45 @@ Amount format:
 - accepts HMA decimal strings with up to 8 decimals
 - examples: `12`, `0.125`, `1.00000001`
 
+## Node CLI (`homa-node`)
+
+The binary entrypoint is `homa-node`.
+
+Show help:
+
+```bash
+cargo run --bin homa-node -- --help
+cargo run --bin homa-node -- run --help
+```
+
+Run node daemon with bounded smoke steps (recommended for first run):
+
+```bash
+cargo run --bin homa-node -- run \
+  --network devnet \
+  --no-bootstrap \
+  --max-steps 5
+```
+
+Run long-lived daemon (Ctrl+C to stop):
+
+```bash
+cargo run --bin homa-node -- run \
+  --network testnet \
+  --seed-domain seed1.homanetwork.io \
+  --fallback-bootstrap /ip4/127.0.0.1/tcp/7000
+```
+
+Useful options:
+
+- `--no-listen` skip opening local listen sockets
+- `--no-bootstrap` skip DNS/fallback bootstrap dial attempts
+- `--strict-bootstrap` fail startup if bootstrap cannot dial
+- `--event-loop-tick-ms <U64>` runtime maintenance tick interval
+- `--min-pow-bits <U16>` mempool admission PoW floor
+- `--max-pending-blocks <USIZE>` pending decoded block queue bound
+- `--max-steps <USIZE>` bounded event-loop steps for smoke/automation
+
 ## Security Model (Current)
 
 - Wallet private keys are encrypted at rest:
@@ -205,7 +248,7 @@ Includes:
 ```bash
 cargo install cargo-fuzz
 cd fuzz
-cargo fuzz run gossipsub_tx_payload -- -max_total_time=60
+cargo +nightly fuzz run gossipsub_tx_payload -- -max_total_time=60
 ```
 
 The fuzz target continuously feeds malformed/random bytes into the transaction gossip decode boundary.

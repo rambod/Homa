@@ -8,6 +8,8 @@ pub mod core;
 pub mod crypto;
 /// Networking and peer-discovery primitives.
 pub mod network;
+/// Node daemon runtime orchestration.
+pub mod node;
 /// Structured metrics and event instrumentation primitives.
 pub mod observability;
 /// Wallet and CLI entrypoints.
