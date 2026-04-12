@@ -11,19 +11,26 @@ use libp2p::gossipsub::Event as GossipsubEvent;
 use libp2p::swarm::{Swarm, SwarmEvent};
 use thiserror::Error;
 
+use crate::consensus::leader::{LeaderElectionError, elect_leader, record_slot_observation};
+use crate::consensus::stake::{StakeError, StakeLedger};
 use crate::core::block::{Block, BlockError};
-use crate::core::genesis::{GenesisError, default_genesis_allocations, forge_genesis};
+use crate::core::genesis::{
+    GENESIS_TIMESTAMP_UNIX_MS, GenesisError, default_genesis_allocations, forge_genesis,
+};
 use crate::core::mempool::{Mempool, MempoolConfig, MempoolError, TransactionId, transaction_id};
 use crate::core::recovery::{RecoveryError, RecoveryPaths, commit_state_snapshot_atomic};
 use crate::core::state::ChainState;
+use crate::core::state::StateError;
 use crate::core::sync::{SnapshotAdmissionPolicy, SnapshotImportMode};
-use crate::crypto::address::Network;
+use crate::core::transaction::Transaction;
+use crate::crypto::address::{AddressError, Network, derive_address};
+use crate::crypto::keys::{CryptoError, Keypair, SECRET_KEY_LENGTH};
 use crate::network::checkpoint_rotation::{
     CheckpointRotationPolicy, RotationIngestOutcome, TrustedCheckpointSet,
 };
 use crate::network::p2p::{
     DEFAULT_BOOTSTRAP_QUIC_PORT, DEFAULT_BOOTSTRAP_TCP_PORT, HomaBehaviour, HomaBehaviourEvent,
-    NetworkError, P2PConfig, add_kademlia_address, bootstrap_dht, build_swarm,
+    NetworkError, P2PConfig, add_kademlia_address, blocks_topic, bootstrap_dht, build_swarm,
     resolve_bootstrap_addresses,
 };
 use crate::network::reputation::{AdaptivePenaltyPolicy, ReputationEvent, ReputationPolicy};
@@ -39,12 +46,20 @@ use crate::network::sync_engine::{
 use crate::network::sync_runtime::{
     SnapshotImportFailurePolicy, SyncRuntimeCoordinator, SyncRuntimeError,
 };
-use crate::observability::Observability;
+use crate::observability::{GossipOperation, Observability};
 
 /// Default in-memory queue bound for decoded pending block payloads.
 pub const DEFAULT_MAX_PENDING_BLOCKS: usize = 512;
 /// Default runtime event-loop poll interval.
 pub const DEFAULT_EVENT_LOOP_TICK_MS: u64 = 250;
+/// Default consensus slot duration for proposer scheduling.
+pub const DEFAULT_SLOT_DURATION_MS: u64 = 1_000;
+/// Default transaction cap for one locally produced block.
+pub const DEFAULT_MAX_BLOCK_TRANSACTIONS: usize = 1_024;
+/// Scale used to normalize large genesis balances into practical leader-election weights.
+const NORMALIZED_GENESIS_STAKE_SCALE: u64 = 10_000;
+/// Maximum publish attempts for one locally produced block.
+const BLOCK_PUBLISH_MAX_ATTEMPTS: usize = 3;
 
 /// Node daemon runtime configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,8 +90,14 @@ pub struct NodeDaemonConfig {
     pub observability_event_capacity: usize,
     /// Runtime event-loop tick interval in milliseconds.
     pub event_loop_tick_ms: u64,
+    /// Consensus slot duration used for deterministic leader scheduling.
+    pub slot_duration_ms: u64,
+    /// Maximum transactions selected for one locally produced block.
+    pub max_block_transactions: usize,
     /// Maximum decoded pending blocks retained in-memory.
     pub max_pending_blocks: usize,
+    /// Optional local producer secret key for block production.
+    pub producer_secret_key: Option<[u8; SECRET_KEY_LENGTH]>,
 }
 
 impl NodeDaemonConfig {
@@ -114,7 +135,10 @@ impl Default for NodeDaemonConfig {
             snapshot_import_failure_policy: SnapshotImportFailurePolicy::default(),
             observability_event_capacity: crate::observability::DEFAULT_EVENT_CAPACITY,
             event_loop_tick_ms: DEFAULT_EVENT_LOOP_TICK_MS,
+            slot_duration_ms: DEFAULT_SLOT_DURATION_MS,
+            max_block_transactions: DEFAULT_MAX_BLOCK_TRANSACTIONS,
             max_pending_blocks: DEFAULT_MAX_PENDING_BLOCKS,
+            producer_secret_key: None,
         }
     }
 }
@@ -164,6 +188,10 @@ pub struct NodeRuntimeStats {
     pub blocks_finalized_total: u64,
     /// Number of pending blocks rejected during finalization checks.
     pub block_rejected_total: u64,
+    /// Number of blocks successfully produced by local validator.
+    pub blocks_produced_total: u64,
+    /// Number of produced block publish failures.
+    pub block_publish_failure_total: u64,
     /// Number of pending-block queue evictions due to capacity bound.
     pub pending_block_evictions_total: u64,
     /// Number of accepted sync chunk requests.
@@ -191,6 +219,8 @@ pub struct NodeMaintenanceReport {
     pub finalized_blocks: usize,
     /// Number of pending blocks rejected this tick.
     pub rejected_blocks: usize,
+    /// Number of locally produced blocks this tick.
+    pub produced_blocks: usize,
     /// Number of snapshots imported this tick.
     pub imported_snapshots: usize,
     /// Number of snapshots quarantined this tick.
@@ -212,6 +242,8 @@ pub struct NodeEventLoopReport {
     pub finalized_blocks: usize,
     /// Number of pending blocks rejected during maintenance ticks.
     pub rejected_blocks: usize,
+    /// Number of locally produced blocks during maintenance ticks.
+    pub produced_blocks: usize,
     /// Number of imported snapshots observed across ticks.
     pub imported_snapshots: usize,
     /// Number of quarantined snapshots observed across ticks.
@@ -237,6 +269,11 @@ struct NodePendingBlockProcessingReport {
     rejected_blocks: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct NodeBlockProductionReport {
+    produced_blocks: usize,
+}
+
 impl NodeEventLoopReport {
     const fn absorb(&mut self, other: Self) {
         self.processed_swarm_events = self
@@ -250,6 +287,7 @@ impl NodeEventLoopReport {
             .saturating_add(other.maintenance_ticks);
         self.finalized_blocks = self.finalized_blocks.saturating_add(other.finalized_blocks);
         self.rejected_blocks = self.rejected_blocks.saturating_add(other.rejected_blocks);
+        self.produced_blocks = self.produced_blocks.saturating_add(other.produced_blocks);
         self.imported_snapshots = self
             .imported_snapshots
             .saturating_add(other.imported_snapshots);
@@ -270,6 +308,36 @@ pub enum NodeDaemonError {
     Genesis {
         /// Underlying genesis error.
         source: GenesisError,
+    },
+    /// Stake-ledger bootstrap failed.
+    #[error("node daemon stake-ledger bootstrap failed: {source}")]
+    Stake {
+        /// Underlying stake error.
+        source: StakeError,
+    },
+    /// Leader election failed for one scheduling slot.
+    #[error("node daemon leader election failed: {source}")]
+    LeaderElection {
+        /// Underlying election error.
+        source: LeaderElectionError,
+    },
+    /// Local producer secret key could not initialize.
+    #[error("node daemon local producer key initialization failed: {source}")]
+    ProducerKey {
+        /// Underlying key initialization error.
+        source: CryptoError,
+    },
+    /// Local producer address derivation failed.
+    #[error("node daemon local producer address derivation failed: {source}")]
+    ProducerAddress {
+        /// Underlying address derivation error.
+        source: AddressError,
+    },
+    /// Configured producer is not present in active stake set.
+    #[error("node daemon local producer is not staked: {address}")]
+    ProducerNotStaked {
+        /// Derived producer address.
+        address: String,
     },
     /// Config network mismatches state network.
     #[error(
@@ -316,6 +384,18 @@ pub enum NodeDaemonError {
         /// Underlying block error.
         source: BlockError,
     },
+    /// Produced block construction failed.
+    #[error("node daemon block production failed: {source}")]
+    BlockBuild {
+        /// Underlying block-construction error.
+        source: BlockError,
+    },
+    /// Produced block state transition failed.
+    #[error("node daemon produced block state transition failed: {source}")]
+    BlockStateTransition {
+        /// Underlying state-transition error.
+        source: StateError,
+    },
     /// Hashing current finalized block failed during pending-block processing.
     #[error("node daemon finalized block hash computation failed: {source}")]
     FinalizedBlockHash {
@@ -354,9 +434,18 @@ pub enum NodeDaemonError {
     SwarmClosed,
 }
 
+#[derive(Debug)]
+struct LocalBlockProducer {
+    address: String,
+    keypair: Keypair,
+    last_observed_slot: Option<u64>,
+}
+
 /// Long-running daemon skeleton that wires runtime policy + sync + mempool handling.
 pub struct NodeDaemon {
     config: NodeDaemonConfig,
+    stake_ledger: StakeLedger,
+    local_block_producer: Option<LocalBlockProducer>,
     controller: SyncRuntimePolicyController,
     sync_runtime: SyncRuntimeCoordinator,
     chain_state: ChainState,
@@ -373,6 +462,14 @@ impl std::fmt::Debug for NodeDaemon {
         formatter
             .debug_struct("NodeDaemon")
             .field("config", &self.config)
+            .field("stake_ledger", &self.stake_ledger)
+            .field(
+                "local_block_producer",
+                &self
+                    .local_block_producer
+                    .as_ref()
+                    .map(|producer| &producer.address),
+            )
             .field("controller", &self.controller)
             .field("sync_runtime", &self.sync_runtime)
             .field("chain_state", &self.chain_state)
@@ -396,9 +493,16 @@ impl NodeDaemon {
     pub fn from_genesis_with_config(config: NodeDaemonConfig) -> Result<Self, NodeDaemonError> {
         let network = config.network;
         let trusted_set = trusted_checkpoint_set_from_genesis(network)?;
+        let stake_ledger = stake_ledger_from_genesis(network)?;
         let (genesis_block, chain_state) =
             forge_genesis(network).map_err(|source| NodeDaemonError::Genesis { source })?;
-        Self::new(config, genesis_block, chain_state, trusted_set)
+        Self::new(
+            config,
+            genesis_block,
+            chain_state,
+            trusted_set,
+            stake_ledger,
+        )
     }
 
     /// Creates a daemon from explicit runtime config and initialized state.
@@ -407,6 +511,7 @@ impl NodeDaemon {
         finalized_block: Block,
         chain_state: ChainState,
         trusted_checkpoint_set: TrustedCheckpointSet,
+        stake_ledger: StakeLedger,
     ) -> Result<Self, NodeDaemonError> {
         let config_network = config.network.as_byte();
         let state_network = chain_state.network().as_byte();
@@ -442,9 +547,12 @@ impl NodeDaemon {
         .map_err(|source| NodeDaemonError::SyncRuntimeConfig { source })?;
         let mempool = Mempool::new(config.mempool_config);
         let observability = Observability::new(config.observability_event_capacity);
+        let local_block_producer = local_block_producer_from_config(&config, &stake_ledger)?;
 
         Ok(Self {
             config,
+            stake_ledger,
+            local_block_producer,
             controller,
             sync_runtime,
             chain_state,
@@ -634,6 +742,7 @@ impl NodeDaemon {
         }
 
         let block_processing = self.process_pending_blocks(self.config.max_pending_blocks)?;
+        let production = self.maybe_produce_local_block(now_ms)?;
 
         let import_mode = SnapshotImportMode::SteadyState {
             local_finalized_height: self.finalized_block.header.height,
@@ -657,12 +766,16 @@ impl NodeDaemon {
             self.stats.snapshot_import_blocked_total =
                 self.stats.snapshot_import_blocked_total.saturating_add(1);
         }
+        let finalized_blocks = block_processing
+            .finalized_blocks
+            .saturating_add(production.produced_blocks);
 
         Ok(NodeMaintenanceReport {
             retried_requests: timeout_feedback.retries.len(),
             exhausted_requests: timeout_feedback.exhausted.len(),
-            finalized_blocks: block_processing.finalized_blocks,
+            finalized_blocks,
             rejected_blocks: block_processing.rejected_blocks,
+            produced_blocks: production.produced_blocks,
             imported_snapshots: batch.imported.len(),
             quarantined_snapshots: batch.quarantined.len(),
             blocked_import: batch.blocked,
@@ -672,6 +785,187 @@ impl NodeDaemon {
     /// Runs one maintenance tick using the current wall-clock timestamp.
     pub fn run_maintenance_tick_now(&mut self) -> Result<NodeMaintenanceReport, NodeDaemonError> {
         self.run_maintenance_tick(now_unix_ms())
+    }
+
+    fn maybe_produce_local_block(
+        &mut self,
+        now_ms: u64,
+    ) -> Result<NodeBlockProductionReport, NodeDaemonError> {
+        let Some(local_producer) = self.local_block_producer.as_mut() else {
+            return Ok(NodeBlockProductionReport::default());
+        };
+
+        let slot = slot_from_timestamp(now_ms, self.config.slot_duration_ms);
+        if local_producer.last_observed_slot == Some(slot) {
+            return Ok(NodeBlockProductionReport::default());
+        }
+        local_producer.last_observed_slot = Some(slot);
+        let producer_address = local_producer.address.clone();
+
+        let selection = elect_leader(&self.stake_ledger, slot)
+            .map_err(|source| NodeDaemonError::LeaderElection { source })?;
+        if selection.leader != producer_address {
+            return Ok(NodeBlockProductionReport::default());
+        }
+
+        let Ok(candidate_block) = self.build_local_block_candidate(&producer_address, now_ms)
+        else {
+            let _ = record_slot_observation(&self.observability, slot, &producer_address, None);
+            return Ok(NodeBlockProductionReport::default());
+        };
+
+        let Ok(signing_bytes) = candidate_block.header_signing_bytes() else {
+            let _ = record_slot_observation(&self.observability, slot, &producer_address, None);
+            return Ok(NodeBlockProductionReport::default());
+        };
+
+        let signature = self
+            .local_block_producer
+            .as_ref()
+            .map(|producer| producer.keypair.sign(&signing_bytes))
+            .ok_or_else(|| NodeDaemonError::ProducerNotStaked {
+                address: producer_address.clone(),
+            })?;
+        let produced_block = candidate_block.with_proposer_signature(signature);
+        if self.apply_finalized_block(produced_block.clone()).is_err() {
+            let _ = record_slot_observation(&self.observability, slot, &producer_address, None);
+            self.stats.block_rejected_total = self.stats.block_rejected_total.saturating_add(1);
+            return Ok(NodeBlockProductionReport::default());
+        }
+
+        self.stats.blocks_produced_total = self.stats.blocks_produced_total.saturating_add(1);
+        let encoded = produced_block
+            .encode()
+            .map_err(|source| NodeDaemonError::BlockBuild { source })?;
+        let _ = self.publish_produced_block_best_effort(&encoded);
+
+        Ok(NodeBlockProductionReport { produced_blocks: 1 })
+    }
+
+    fn build_local_block_candidate(
+        &self,
+        producer: &str,
+        now_ms: u64,
+    ) -> Result<Block, NodeDaemonError> {
+        let next_height = self.finalized_block.header.height.saturating_add(1);
+        let previous_block_hash = self
+            .finalized_block
+            .hash()
+            .map_err(|source| NodeDaemonError::BlockBuild { source })?;
+        let selected_transactions =
+            self.select_production_transactions(producer, next_height, now_ms)?;
+
+        let mut projected_state = self.chain_state.clone();
+        if !selected_transactions.is_empty() {
+            let provisional_header = crate::core::block::BlockHeader::new(
+                next_height,
+                previous_block_hash,
+                projected_state.state_root(),
+                now_ms,
+                producer.to_owned(),
+            );
+            let provisional_block =
+                Block::new_unsigned(provisional_header, selected_transactions.clone())
+                    .map_err(|source| NodeDaemonError::BlockBuild { source })?;
+            projected_state
+                .apply_block(&provisional_block)
+                .map_err(|source| NodeDaemonError::BlockStateTransition { source })?;
+        }
+
+        let header = crate::core::block::BlockHeader::new(
+            next_height,
+            previous_block_hash,
+            projected_state.state_root(),
+            now_ms,
+            producer.to_owned(),
+        );
+        Block::new_unsigned(header, selected_transactions)
+            .map_err(|source| NodeDaemonError::BlockBuild { source })
+    }
+
+    fn select_production_transactions(
+        &self,
+        proposer: &str,
+        block_height: u64,
+        timestamp_unix_ms: u64,
+    ) -> Result<Vec<Transaction>, NodeDaemonError> {
+        let candidates = self
+            .mempool
+            .prioritized_transactions(self.config.max_block_transactions);
+        let mut projected_state = self.chain_state.clone();
+        let mut selected = Vec::new();
+
+        for (_, transaction) in candidates {
+            let provisional_header = crate::core::block::BlockHeader::new(
+                block_height,
+                [0_u8; crate::core::block::HASH_LENGTH],
+                projected_state.state_root(),
+                timestamp_unix_ms,
+                proposer.to_owned(),
+            );
+            let provisional_block =
+                Block::new_unsigned(provisional_header, vec![transaction.clone()])
+                    .map_err(|source| NodeDaemonError::BlockBuild { source })?;
+            if projected_state.apply_block(&provisional_block).is_ok() {
+                selected.push(transaction);
+            }
+        }
+
+        Ok(selected)
+    }
+
+    fn apply_finalized_block(&mut self, block: Block) -> Result<(), NodeDaemonError> {
+        let mut next_state = self.chain_state.clone();
+        next_state
+            .apply_block(&block)
+            .map_err(|source| NodeDaemonError::BlockStateTransition { source })?;
+        if next_state.state_root() != block.header.state_root {
+            return Err(NodeDaemonError::FinalizedStateRootMismatch);
+        }
+
+        self.remove_included_transactions_from_mempool(&block);
+        self.chain_state = next_state;
+        self.finalized_block = block;
+        self.stats.blocks_finalized_total = self.stats.blocks_finalized_total.saturating_add(1);
+        Ok(())
+    }
+
+    fn publish_produced_block_best_effort(&mut self, payload: &[u8]) -> bool {
+        let Some(swarm) = self.swarm.as_mut() else {
+            return false;
+        };
+        let topic = blocks_topic();
+        for _ in 0..BLOCK_PUBLISH_MAX_ATTEMPTS {
+            match swarm
+                .behaviour_mut()
+                .gossipsub
+                .publish(topic.clone(), payload.to_owned())
+            {
+                Ok(_) => return true,
+                Err(libp2p::gossipsub::PublishError::NoPeersSubscribedToTopic) => {}
+                Err(source) => {
+                    self.stats.block_publish_failure_total =
+                        self.stats.block_publish_failure_total.saturating_add(1);
+                    self.observability.record_gossip_failure(
+                        crate::network::p2p::BLOCKS_TOPIC,
+                        GossipOperation::Publish,
+                        None,
+                        &source.to_string(),
+                    );
+                    return false;
+                }
+            }
+        }
+
+        self.stats.block_publish_failure_total =
+            self.stats.block_publish_failure_total.saturating_add(1);
+        self.observability.record_gossip_failure(
+            crate::network::p2p::BLOCKS_TOPIC,
+            GossipOperation::Publish,
+            None,
+            "no peers subscribed to block topic",
+        );
+        false
     }
 
     /// Handles one raw swarm event and routes gossipsub messages through daemon inbound handling.
@@ -727,6 +1021,9 @@ impl NodeDaemon {
                     report.rejected_blocks = report
                         .rejected_blocks
                         .saturating_add(maintenance.rejected_blocks);
+                    report.produced_blocks = report
+                        .produced_blocks
+                        .saturating_add(maintenance.produced_blocks);
                     report.imported_snapshots = report
                         .imported_snapshots
                         .saturating_add(maintenance.imported_snapshots);
@@ -914,21 +1211,10 @@ impl NodeDaemon {
     }
 
     fn try_finalize_pending_block(&mut self, block: Block) -> bool {
-        let mut next_state = self.chain_state.clone();
-        if next_state.apply_block(&block).is_err() {
+        if self.apply_finalized_block(block).is_err() {
             self.stats.block_rejected_total = self.stats.block_rejected_total.saturating_add(1);
             return false;
         }
-
-        if next_state.state_root() != block.header.state_root {
-            self.stats.block_rejected_total = self.stats.block_rejected_total.saturating_add(1);
-            return false;
-        }
-
-        self.remove_included_transactions_from_mempool(&block);
-        self.chain_state = next_state;
-        self.finalized_block = block;
-        self.stats.blocks_finalized_total = self.stats.blocks_finalized_total.saturating_add(1);
         true
     }
 
@@ -973,6 +1259,43 @@ impl NodeDaemon {
     }
 }
 
+fn local_block_producer_from_config(
+    config: &NodeDaemonConfig,
+    stake_ledger: &StakeLedger,
+) -> Result<Option<LocalBlockProducer>, NodeDaemonError> {
+    let Some(secret_key) = config.producer_secret_key else {
+        return Ok(None);
+    };
+    let keypair = Keypair::from_secret_key(&secret_key)
+        .map_err(|source| NodeDaemonError::ProducerKey { source })?;
+    let address = derive_address(&keypair.public_key_bytes(), config.network)
+        .map_err(|source| NodeDaemonError::ProducerAddress { source })?;
+    if stake_ledger.stake_of(&address) == 0 {
+        return Err(NodeDaemonError::ProducerNotStaked { address });
+    }
+
+    Ok(Some(LocalBlockProducer {
+        address,
+        keypair,
+        last_observed_slot: None,
+    }))
+}
+
+fn normalized_stake_weight(allocation: u64, total_allocation: u64) -> u64 {
+    if total_allocation == 0 {
+        return 1;
+    }
+    let scaled = (u128::from(allocation) * u128::from(NORMALIZED_GENESIS_STAKE_SCALE))
+        / u128::from(total_allocation);
+    let scaled_u64 = u64::try_from(scaled).unwrap_or(1);
+    scaled_u64.max(1)
+}
+
+fn slot_from_timestamp(now_ms: u64, slot_duration_ms: u64) -> u64 {
+    let elapsed = now_ms.saturating_sub(GENESIS_TIMESTAMP_UNIX_MS);
+    elapsed / slot_duration_ms.max(1)
+}
+
 /// Builds initial trusted-checkpoint set from deterministic genesis validator addresses.
 pub fn trusted_checkpoint_set_from_genesis(
     network: Network,
@@ -994,6 +1317,21 @@ pub fn trusted_checkpoint_set_from_genesis(
     })
 }
 
+/// Builds initial stake ledger from deterministic genesis validator allocations.
+pub fn stake_ledger_from_genesis(network: Network) -> Result<StakeLedger, NodeDaemonError> {
+    let allocations = default_genesis_allocations(network)
+        .map_err(|source| NodeDaemonError::Genesis { source })?;
+    let total_allocation = allocations.iter().map(|(_, amount)| *amount).sum::<u64>();
+    let mut ledger = StakeLedger::new(network);
+    for (address, allocation) in allocations {
+        let weight = normalized_stake_weight(allocation, total_allocation);
+        ledger
+            .add_stake(address, weight)
+            .map_err(|source| NodeDaemonError::Stake { source })?;
+    }
+    Ok(ledger)
+}
+
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1005,10 +1343,12 @@ fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        NodeDaemon, NodeDaemonConfig, NodeDaemonError, NodeInboundOutcome,
-        trusted_checkpoint_set_from_genesis,
+        DEFAULT_SLOT_DURATION_MS, NodeDaemon, NodeDaemonConfig, NodeDaemonError,
+        NodeInboundOutcome, stake_ledger_from_genesis, trusted_checkpoint_set_from_genesis,
     };
+    use crate::consensus::leader::elect_leader;
     use crate::core::block::{Block, BlockHeader};
+    use crate::core::genesis::GENESIS_TIMESTAMP_UNIX_MS;
     use crate::core::genesis::forge_genesis;
     use crate::core::mempool::MempoolConfig;
     use crate::core::recovery::SNAPSHOT_FILE_NAME;
@@ -1033,13 +1373,76 @@ mod tests {
         let trusted = trusted_checkpoint_set_from_genesis(network);
         assert!(trusted.is_ok(), "trusted-set bootstrap should succeed");
         let trusted = trusted.unwrap_or_else(|_| unreachable!());
+        let stake_ledger = stake_ledger_from_genesis(network);
+        assert!(
+            stake_ledger.is_ok(),
+            "stake ledger bootstrap should succeed"
+        );
+        let stake_ledger = stake_ledger.unwrap_or_else(|_| unreachable!());
         let forged = forge_genesis(network);
         assert!(forged.is_ok(), "genesis forge should succeed");
         let (genesis_block, chain_state) = forged.unwrap_or_else(|_| unreachable!());
 
-        let daemon = NodeDaemon::new(config, genesis_block, chain_state, trusted);
+        let daemon = NodeDaemon::new(config, genesis_block, chain_state, trusted, stake_ledger);
         assert!(daemon.is_ok(), "daemon should initialize");
         daemon.unwrap_or_else(|_| unreachable!())
+    }
+
+    fn daemon_with_local_producer(network: Network) -> NodeDaemon {
+        let mut config = NodeDaemonConfig::for_network(network);
+        config.mempool_config = MempoolConfig::new(10_000, 0, network);
+        config.max_pending_blocks = 16;
+        config.slot_duration_ms = DEFAULT_SLOT_DURATION_MS;
+        config.producer_secret_key = Some([1_u8; 32]);
+        config.max_block_transactions = 64;
+
+        let trusted = trusted_checkpoint_set_from_genesis(network);
+        assert!(trusted.is_ok(), "trusted-set bootstrap should succeed");
+        let trusted = trusted.unwrap_or_else(|_| unreachable!());
+        let stake_ledger = stake_ledger_from_genesis(network);
+        assert!(
+            stake_ledger.is_ok(),
+            "stake ledger bootstrap should succeed"
+        );
+        let stake_ledger = stake_ledger.unwrap_or_else(|_| unreachable!());
+        let forged = forge_genesis(network);
+        assert!(forged.is_ok(), "genesis forge should succeed");
+        let (genesis_block, chain_state) = forged.unwrap_or_else(|_| unreachable!());
+
+        let daemon = NodeDaemon::new(config, genesis_block, chain_state, trusted, stake_ledger);
+        assert!(daemon.is_ok(), "daemon should initialize");
+        daemon.unwrap_or_else(|_| unreachable!())
+    }
+
+    fn producer_address(network: Network) -> String {
+        let keypair = Keypair::from_secret_key(&[1_u8; 32]);
+        assert!(keypair.is_ok(), "producer key should parse");
+        let keypair = keypair.unwrap_or_else(|_| unreachable!());
+        let address = derive_address(&keypair.public_key_bytes(), network);
+        assert!(address.is_ok(), "producer address should derive");
+        address.unwrap_or_else(|_| unreachable!())
+    }
+
+    fn slot_for_leader(network: Network, leader: &str, start_slot: u64) -> u64 {
+        let ledger = stake_ledger_from_genesis(network);
+        assert!(ledger.is_ok(), "stake ledger should build");
+        let ledger = ledger.unwrap_or_else(|_| unreachable!());
+
+        for slot in start_slot..start_slot.saturating_add(50_000) {
+            let selected = elect_leader(&ledger, slot);
+            assert!(selected.is_ok(), "leader election should succeed");
+            if selected.unwrap_or_else(|_| unreachable!()).leader == leader {
+                return slot;
+            }
+        }
+
+        unreachable!("leader slot should be found within bounded search window");
+    }
+
+    fn timestamp_for_slot(slot: u64, slot_duration_ms: u64) -> u64 {
+        GENESIS_TIMESTAMP_UNIX_MS
+            .saturating_add(slot.saturating_mul(slot_duration_ms))
+            .saturating_add(1)
     }
 
     fn signed_transaction(network: Network) -> Transaction {
@@ -1412,6 +1815,74 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_tick_produces_local_block_when_node_is_slot_leader() {
+        let network = Network::Testnet;
+        let mut daemon = daemon_with_local_producer(network);
+        let address = producer_address(network);
+        let slot = slot_for_leader(network, &address, 0);
+        let now_ms = timestamp_for_slot(slot, DEFAULT_SLOT_DURATION_MS);
+
+        let report = daemon.run_maintenance_tick(now_ms);
+        assert!(report.is_ok(), "maintenance tick should run");
+        let report = report.unwrap_or_else(|_| unreachable!());
+        assert_eq!(report.produced_blocks, 1);
+        assert_eq!(report.finalized_blocks, 1);
+        assert_eq!(daemon.finalized_block().header.height, 1);
+        assert_eq!(daemon.stats().blocks_produced_total, 1);
+    }
+
+    #[test]
+    fn maintenance_tick_skips_duplicate_production_for_same_slot() {
+        let network = Network::Testnet;
+        let mut daemon = daemon_with_local_producer(network);
+        let address = producer_address(network);
+        let slot = slot_for_leader(network, &address, 0);
+        let now_ms = timestamp_for_slot(slot, DEFAULT_SLOT_DURATION_MS);
+
+        let first = daemon.run_maintenance_tick(now_ms);
+        assert!(first.is_ok(), "first tick should run");
+        let first = first.unwrap_or_else(|_| unreachable!());
+        assert_eq!(first.produced_blocks, 1);
+
+        let second = daemon.run_maintenance_tick(now_ms);
+        assert!(second.is_ok(), "second tick should run");
+        let second = second.unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            second.produced_blocks, 0,
+            "same slot should not produce more than one block"
+        );
+        assert_eq!(daemon.finalized_block().header.height, 1);
+        assert_eq!(daemon.stats().blocks_produced_total, 1);
+    }
+
+    #[test]
+    fn local_production_consumes_mempool_transactions() {
+        let network = Network::Testnet;
+        let mut daemon = daemon_with_local_producer(network);
+        let transaction = signed_transaction_from_genesis_sender(network, 1, 50, 1);
+        let encoded = transaction.encode();
+        assert!(encoded.is_ok(), "transaction should encode");
+        let admitted = daemon.handle_inbound_gossip_message(
+            TRANSACTIONS_TOPIC,
+            &encoded.unwrap_or_else(|_| unreachable!()),
+            "peer-produce",
+            28_000,
+        );
+        assert!(admitted.is_ok(), "transaction should be admitted");
+        assert_eq!(daemon.mempool_len(), 1);
+
+        let address = producer_address(network);
+        let slot = slot_for_leader(network, &address, 0);
+        let now_ms = timestamp_for_slot(slot, DEFAULT_SLOT_DURATION_MS);
+        let report = daemon.run_maintenance_tick(now_ms);
+        assert!(report.is_ok(), "maintenance should run");
+        let report = report.unwrap_or_else(|_| unreachable!());
+        assert_eq!(report.produced_blocks, 1);
+        assert_eq!(daemon.mempool_len(), 0);
+        assert_eq!(daemon.finalized_block().header.height, 1);
+    }
+
+    #[test]
     fn maintenance_tick_imports_completed_snapshot_and_updates_observability() {
         let network = Network::Testnet;
         let mut daemon = daemon_with_low_pow(network);
@@ -1466,6 +1937,7 @@ mod tests {
 
         assert_eq!(report.finalized_blocks, 0);
         assert_eq!(report.rejected_blocks, 0);
+        assert_eq!(report.produced_blocks, 0);
         assert_eq!(report.imported_snapshots, 1);
         assert_eq!(report.quarantined_snapshots, 0);
         assert!(report.blocked_import.is_none());

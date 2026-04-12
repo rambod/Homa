@@ -69,6 +69,12 @@ struct NodeRunArgs {
     /// Runtime event loop tick interval in milliseconds.
     #[arg(long)]
     event_loop_tick_ms: Option<u64>,
+    /// Consensus slot duration in milliseconds for leader scheduling.
+    #[arg(long)]
+    slot_duration_ms: Option<u64>,
+    /// Maximum transactions selected while producing one local block.
+    #[arg(long)]
+    max_block_transactions: Option<usize>,
     /// Maximum inbound pending block queue length.
     #[arg(long)]
     max_pending_blocks: Option<usize>,
@@ -78,6 +84,9 @@ struct NodeRunArgs {
     /// Optional persistence directory flushed during graceful shutdown.
     #[arg(long)]
     state_directory: Option<PathBuf>,
+    /// Optional hex-encoded 32-byte local producer secret key.
+    #[arg(long)]
+    producer_secret_key_hex: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -136,25 +145,34 @@ async fn run_node(args: NodeRunArgs) -> Result<(), NodeCliError> {
     run_daemon(&mut daemon, &runtime_config).await
 }
 
-fn daemon_config_from_runtime(runtime_config: &NodeRuntimeConfig) -> NodeDaemonConfig {
+fn daemon_config_from_runtime(
+    runtime_config: &NodeRuntimeConfig,
+) -> Result<NodeDaemonConfig, NodeCliError> {
     let network = runtime_config.network();
     let mut config = NodeDaemonConfig::for_network(network);
     config.event_loop_tick_ms = runtime_config.event_loop_tick_ms;
+    config.slot_duration_ms = runtime_config.slot_duration_ms;
+    config.max_block_transactions = runtime_config.max_block_transactions;
     config.max_pending_blocks = runtime_config.max_pending_blocks;
+    config.producer_secret_key = runtime_config
+        .producer_secret_key_bytes()
+        .map_err(|source| NodeCliError::Config {
+            source: Box::new(source),
+        })?;
     config.mempool_config = MempoolConfig {
         min_pow_difficulty_bits: runtime_config.min_pow_bits,
         network,
         ..config.mempool_config
     };
-    config
+    Ok(config)
 }
 
 fn initialize_daemon(runtime_config: &NodeRuntimeConfig) -> Result<NodeDaemon, NodeCliError> {
-    let mut daemon = NodeDaemon::from_genesis_with_config(daemon_config_from_runtime(
-        runtime_config,
-    ))
-    .map_err(|source| NodeCliError::Daemon {
-        source: Box::new(source),
+    let daemon_config = daemon_config_from_runtime(runtime_config)?;
+    let mut daemon = NodeDaemon::from_genesis_with_config(daemon_config).map_err(|source| {
+        NodeCliError::Daemon {
+            source: Box::new(source),
+        }
     })?;
     daemon
         .build_and_attach_swarm(P2PConfig::default())
@@ -228,9 +246,10 @@ async fn run_daemon_until_signal(
     runtime_config: &NodeRuntimeConfig,
 ) -> Result<(), NodeCliError> {
     println!(
-        "node daemon started: network={} tick_ms={} (press Ctrl+C to stop)",
+        "node daemon started: network={} tick_ms={} slot_ms={} (press Ctrl+C to stop)",
         runtime_config.network(),
-        runtime_config.event_loop_tick_ms
+        runtime_config.event_loop_tick_ms,
+        runtime_config.slot_duration_ms,
     );
     let report = daemon
         .run_until_ctrl_c()
@@ -252,12 +271,13 @@ fn print_daemon_report(
     let stats = daemon.stats();
     if let Some(max_steps) = max_steps {
         println!(
-            "{prefix}: steps={max_steps} swarm_events={} gossip_messages={} maintenance_ticks={} finalized_blocks={} rejected_blocks={} imported_snapshots={} quarantined_snapshots={} blocked_import_events={} tx_admitted={} tx_rejected={} blocks_finalized_total={} blocks_rejected_total={} mempool_len={} pending_blocks={}",
+            "{prefix}: steps={max_steps} swarm_events={} gossip_messages={} maintenance_ticks={} finalized_blocks={} rejected_blocks={} produced_blocks={} imported_snapshots={} quarantined_snapshots={} blocked_import_events={} tx_admitted={} tx_rejected={} blocks_finalized_total={} blocks_rejected_total={} blocks_produced_total={} block_publish_failure_total={} mempool_len={} pending_blocks={}",
             report.processed_swarm_events,
             report.processed_gossip_messages,
             report.maintenance_ticks,
             report.finalized_blocks,
             report.rejected_blocks,
+            report.produced_blocks,
             report.imported_snapshots,
             report.quarantined_snapshots,
             report.blocked_import_events,
@@ -265,6 +285,8 @@ fn print_daemon_report(
             stats.tx_rejected_total,
             stats.blocks_finalized_total,
             stats.block_rejected_total,
+            stats.blocks_produced_total,
+            stats.block_publish_failure_total,
             daemon.mempool_len(),
             daemon.pending_block_count(),
         );
@@ -272,12 +294,13 @@ fn print_daemon_report(
     }
 
     println!(
-        "{prefix}: swarm_events={} gossip_messages={} maintenance_ticks={} finalized_blocks={} rejected_blocks={} imported_snapshots={} quarantined_snapshots={} blocked_import_events={} tx_admitted={} tx_rejected={} blocks_finalized_total={} blocks_rejected_total={} mempool_len={} pending_blocks={}",
+        "{prefix}: swarm_events={} gossip_messages={} maintenance_ticks={} finalized_blocks={} rejected_blocks={} produced_blocks={} imported_snapshots={} quarantined_snapshots={} blocked_import_events={} tx_admitted={} tx_rejected={} blocks_finalized_total={} blocks_rejected_total={} blocks_produced_total={} block_publish_failure_total={} mempool_len={} pending_blocks={}",
         report.processed_swarm_events,
         report.processed_gossip_messages,
         report.maintenance_ticks,
         report.finalized_blocks,
         report.rejected_blocks,
+        report.produced_blocks,
         report.imported_snapshots,
         report.quarantined_snapshots,
         report.blocked_import_events,
@@ -285,6 +308,8 @@ fn print_daemon_report(
         stats.tx_rejected_total,
         stats.blocks_finalized_total,
         stats.block_rejected_total,
+        stats.blocks_produced_total,
+        stats.block_publish_failure_total,
         daemon.mempool_len(),
         daemon.pending_block_count(),
     );
@@ -310,9 +335,12 @@ fn runtime_overrides_from_args(args: NodeRunArgs) -> NodeRuntimeOverrides {
         strict_bootstrap: args.strict_bootstrap,
         min_pow_bits: args.min_pow_bits,
         event_loop_tick_ms: args.event_loop_tick_ms,
+        slot_duration_ms: args.slot_duration_ms,
+        max_block_transactions: args.max_block_transactions,
         max_pending_blocks: args.max_pending_blocks,
         max_steps: args.max_steps,
         state_directory: args.state_directory,
+        producer_secret_key_hex: args.producer_secret_key_hex,
     }
 }
 

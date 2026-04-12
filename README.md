@@ -19,6 +19,7 @@ Implemented in this repository today:
 - P2P transport and sync wire codecs
 - peer reputation, adaptive penalties, and checkpoint-trust rotation logic
 - node daemon runtime loop wiring with bounded pending-block finalization
+- deterministic local block production (slot-scheduled leader gating + self-finalization)
 - wallet CLI for key generation and transaction broadcasting
 - deterministic chaos and fuzz testing harnesses
 
@@ -67,7 +68,7 @@ Not implemented yet (production gaps):
   - `reputation.rs`: peer scoring and adaptive penalties
   - `checkpoint_rotation.rs`: trusted-checkpoint-set rotation manager
 - `src/node/`
-  - `daemon.rs`: daemon runtime integrating inbound runtime loop, mempool, pending-block finalization, sync maintenance, and swarm polling
+  - `daemon.rs`: daemon runtime integrating inbound runtime loop, pending-block finalization, slot-scheduled block production, sync maintenance, and swarm polling
   - `config.rs`: typed `node.toml` config loading and startup validation
   - `cli.rs`: node daemon command-line entrypoint
 - `src/observability/`
@@ -210,14 +211,18 @@ Useful options:
 - `--no-bootstrap` skip DNS/fallback bootstrap dial attempts
 - `--strict-bootstrap` fail startup if bootstrap cannot dial
 - `--event-loop-tick-ms <U64>` runtime maintenance tick interval
+- `--slot-duration-ms <U64>` consensus slot duration used for leader scheduling
+- `--max-block-transactions <USIZE>` transaction cap for one locally produced block
 - `--min-pow-bits <U16>` mempool admission PoW floor
 - `--max-pending-blocks <USIZE>` pending decoded block queue bound
 - `--max-steps <USIZE>` bounded event-loop steps for smoke/automation
 - `--state-directory <PATH>` enable graceful shutdown persistence flush (state snapshot + sync checkpoint)
+- `--producer-secret-key-hex <HEX>` enable local block production with a 32-byte Ed25519 secret key
 
 Runtime behavior notes:
 
 - each maintenance tick processes timeout/retry feedback, then attempts bounded pending-block finalization
+- if a local producer key is configured, each new slot performs deterministic leader election and produces at most one block when local validator is elected
 - pending blocks are finalized only when height and parent hash match the current finalized tip
 - invalid/stale blocks are rejected; out-of-order future blocks are retained until parent blocks arrive
 - transactions included in finalized blocks are evicted from mempool

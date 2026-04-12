@@ -400,3 +400,22 @@ Close the runtime execution gap by moving queued inbound blocks through determin
 - [x] **Expansion:** Updated `src/node/daemon.rs` with pending-block processing (`process_pending_blocks`, `try_finalize_pending_block`, queue-drop helpers), new counters (`blocks_finalized_total`, `block_rejected_total`), and maintenance/event-loop report fields for finalized/rejected block totals.
 - [x] **Expansion:** Updated `src/node/cli.rs` report output to include finalized/rejected block maintenance counters and cumulative block execution stats.
 - [x] **Expansion:** Added daemon regression tests for valid finalization, state-root mismatch rejection, out-of-order future-block retention/unblocking, and mempool eviction for finalized block transactions.
+
+---
+
+## 25. Phase 24: Block Production & Local Finality (Expansion V18)
+
+Add deterministic proposer-driven block minting to the node runtime so elected validators can build, sign, finalize, and gossip blocks.
+
+### Task List
+- [x] **Slot Scheduler:** Add maintenance-tick slot scheduling with deterministic slot index derivation and one-production-per-slot guard.
+- [x] **Leader Gate:** Run stake-weighted leader election per slot and produce only when local validator is the elected leader.
+- [x] **Block Builder:** Build block candidates from prioritized mempool transactions under a per-block transaction cap, with state-transition prechecks on projected state.
+- [x] **Proposer Signing:** Sign produced block headers with local Ed25519 validator key and attach proposer signature bytes.
+- [x] **Self-Finalization Path:** Apply produced blocks locally through finalized-tip state transition checks and mempool inclusion eviction.
+- [x] **Block Gossip Broadcast:** Add best-effort block publish attempts over `blocks` topic with structured gossip-failure observability and failure counters.
+- [x] **Runtime Config/CLI Surface:** Extend `node.toml` + CLI with slot duration, max block transactions, and optional local producer secret key configuration.
+- [x] **Expansion:** Added normalized genesis stake-ledger bootstrap (`stake_ledger_from_genesis`) so leader rotation remains operational with large genesis balances while preserving proportional validator weights.
+- [x] **Expansion:** Updated `src/node/daemon.rs` with local producer wiring, production metrics (`blocks_produced_total`, `block_publish_failure_total`), and production-aware maintenance/event-loop reporting.
+- [x] **Expansion:** Updated `src/node/config.rs`, `src/node/cli.rs`, `node.toml.example`, and `README.md` for producer runtime configuration and operator-facing controls.
+- [x] **Expansion:** Added regression tests for leader-slot local production, duplicate-slot no-double-produce guard, and mempool-draining local production path.

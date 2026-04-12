@@ -3,6 +3,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use thiserror::Error;
 
@@ -15,6 +16,7 @@ use crate::crypto::address::Network;
 pub const SNAPSHOT_FILE_NAME: &str = "chain_state.snapshot";
 /// Write-ahead log filename used to guarantee recoverability across crashes.
 pub const WAL_FILE_NAME: &str = "chain_state.wal";
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Disk paths used by state commit and recovery routines.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -350,7 +352,12 @@ fn temp_path_for(path: &Path) -> PathBuf {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("state");
-    path.with_file_name(format!("{file_name}.tmp.{}", std::process::id()))
+    let unique_suffix = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    path.with_file_name(format!(
+        "{file_name}.tmp.{}.{}",
+        std::process::id(),
+        unique_suffix
+    ))
 }
 
 fn display_path(path: &Path) -> String {
@@ -360,7 +367,7 @@ fn display_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
         RecoveryError, RecoveryPaths, RecoverySource, commit_state_snapshot_atomic,
@@ -371,18 +378,18 @@ mod tests {
     use crate::crypto::address::{Network, derive_address};
     use crate::crypto::keys::Keypair;
 
+    static TEST_DIRECTORY_COUNTER: AtomicU64 = AtomicU64::new(0);
+
     struct TestDirectory {
         path: PathBuf,
     }
 
     impl TestDirectory {
         fn new() -> Self {
-            let now_nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0_u128, |duration| duration.as_nanos());
+            let unique_suffix = TEST_DIRECTORY_COUNTER.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "homa-recovery-test-{}-{now_nanos}",
-                std::process::id()
+                "homa-recovery-test-{}-{unique_suffix}",
+                std::process::id(),
             ));
             let created = std::fs::create_dir_all(&path);
             assert!(created.is_ok(), "test directory should be created");
@@ -613,5 +620,13 @@ mod tests {
             matches!(recovered, Err(RecoveryError::NoPersistedState)),
             "empty storage should return no-state error"
         );
+    }
+
+    #[test]
+    fn temporary_path_generation_is_unique() {
+        let base = PathBuf::from("state.snapshot");
+        let first = super::temp_path_for(&base);
+        let second = super::temp_path_for(&base);
+        assert_ne!(first, second, "temporary paths should not collide");
     }
 }

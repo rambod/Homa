@@ -7,9 +7,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::crypto::address::Network;
+use crate::crypto::keys::SECRET_KEY_LENGTH;
 
 const DEFAULT_SEED_DOMAIN: &str = "seed1.homanetwork.io";
 const MAX_POW_BITS: u16 = 256;
+const DEFAULT_SLOT_DURATION_MS: u64 = 1_000;
+const DEFAULT_MAX_BLOCK_TRANSACTIONS: usize = 1_024;
 
 /// Typed network selector for node configuration files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -56,12 +59,18 @@ pub struct NodeRuntimeConfig {
     pub min_pow_bits: u16,
     /// Runtime event-loop poll interval in milliseconds.
     pub event_loop_tick_ms: u64,
+    /// Consensus slot duration in milliseconds used for proposer scheduling.
+    pub slot_duration_ms: u64,
+    /// Maximum transactions selected when producing one local block.
+    pub max_block_transactions: usize,
     /// Maximum pending decoded block queue size.
     pub max_pending_blocks: usize,
     /// Optional bounded run-step count for smoke testing.
     pub max_steps: Option<usize>,
     /// Optional persistence directory used for graceful shutdown checkpointing.
     pub state_directory: Option<PathBuf>,
+    /// Optional local block producer secret key (`hex`-encoded 32-byte Ed25519 secret key).
+    pub producer_secret_key_hex: Option<String>,
 }
 
 impl Default for NodeRuntimeConfig {
@@ -75,9 +84,12 @@ impl Default for NodeRuntimeConfig {
             strict_bootstrap: false,
             min_pow_bits: 10,
             event_loop_tick_ms: 250,
+            slot_duration_ms: DEFAULT_SLOT_DURATION_MS,
+            max_block_transactions: DEFAULT_MAX_BLOCK_TRANSACTIONS,
             max_pending_blocks: 512,
             max_steps: None,
             state_directory: None,
+            producer_secret_key_hex: None,
         }
     }
 }
@@ -101,12 +113,18 @@ pub struct NodeRuntimeOverrides {
     pub min_pow_bits: Option<u16>,
     /// Optional event loop tick override.
     pub event_loop_tick_ms: Option<u64>,
+    /// Optional slot duration override.
+    pub slot_duration_ms: Option<u64>,
+    /// Optional per-block transaction cap override.
+    pub max_block_transactions: Option<usize>,
     /// Optional max pending block queue override.
     pub max_pending_blocks: Option<usize>,
     /// Optional bounded step count override.
     pub max_steps: Option<usize>,
     /// Optional persistence directory override.
     pub state_directory: Option<PathBuf>,
+    /// Optional local producer secret key override.
+    pub producer_secret_key_hex: Option<String>,
 }
 
 impl NodeRuntimeConfig {
@@ -148,6 +166,12 @@ impl NodeRuntimeConfig {
         if let Some(event_loop_tick_ms) = overrides.event_loop_tick_ms {
             self.event_loop_tick_ms = event_loop_tick_ms;
         }
+        if let Some(slot_duration_ms) = overrides.slot_duration_ms {
+            self.slot_duration_ms = slot_duration_ms;
+        }
+        if let Some(max_block_transactions) = overrides.max_block_transactions {
+            self.max_block_transactions = max_block_transactions;
+        }
         if let Some(max_pending_blocks) = overrides.max_pending_blocks {
             self.max_pending_blocks = max_pending_blocks;
         }
@@ -156,6 +180,9 @@ impl NodeRuntimeConfig {
         }
         if let Some(state_directory) = &overrides.state_directory {
             self.state_directory = Some(state_directory.clone());
+        }
+        if let Some(producer_secret_key_hex) = &overrides.producer_secret_key_hex {
+            self.producer_secret_key_hex = Some(producer_secret_key_hex.clone());
         }
     }
 
@@ -172,6 +199,16 @@ impl NodeRuntimeConfig {
                 event_loop_tick_ms: self.event_loop_tick_ms,
             });
         }
+        if self.slot_duration_ms == 0 {
+            return Err(NodeConfigError::InvalidSlotDurationMs {
+                slot_duration_ms: self.slot_duration_ms,
+            });
+        }
+        if self.max_block_transactions == 0 {
+            return Err(NodeConfigError::InvalidMaxBlockTransactions {
+                max_block_transactions: self.max_block_transactions,
+            });
+        }
         if self.max_pending_blocks == 0 {
             return Err(NodeConfigError::InvalidPendingBlockLimit {
                 max_pending_blocks: self.max_pending_blocks,
@@ -183,6 +220,7 @@ impl NodeRuntimeConfig {
                 max_pow_bits: MAX_POW_BITS,
             });
         }
+        let _ = self.producer_secret_key_bytes()?;
         if self.bootstrap
             && self.seed_domain.trim().is_empty()
             && self.fallback_bootstrap.is_empty()
@@ -196,6 +234,34 @@ impl NodeRuntimeConfig {
             }
         }
         Ok(())
+    }
+
+    /// Decodes optional producer secret key from hex into fixed 32-byte key material.
+    pub fn producer_secret_key_bytes(
+        &self,
+    ) -> Result<Option<[u8; SECRET_KEY_LENGTH]>, NodeConfigError> {
+        let Some(encoded) = self.producer_secret_key_hex.as_deref() else {
+            return Ok(None);
+        };
+        let sanitized = encoded.trim();
+        if sanitized.is_empty() {
+            return Err(NodeConfigError::InvalidProducerSecretKeyHex {
+                reason: "secret key cannot be empty".to_owned(),
+            });
+        }
+        let decoded =
+            hex::decode(sanitized).map_err(|_| NodeConfigError::InvalidProducerSecretKeyHex {
+                reason: "secret key must be valid hex".to_owned(),
+            })?;
+        if decoded.len() != SECRET_KEY_LENGTH {
+            return Err(NodeConfigError::InvalidProducerSecretKeyLength {
+                expected: SECRET_KEY_LENGTH,
+                actual: decoded.len(),
+            });
+        }
+        let mut key = [0_u8; SECRET_KEY_LENGTH];
+        key.copy_from_slice(&decoded);
+        Ok(Some(key))
     }
 }
 
@@ -224,6 +290,18 @@ pub enum NodeConfigError {
         /// Configured value.
         event_loop_tick_ms: u64,
     },
+    /// Slot duration must be non-zero.
+    #[error("invalid node config: slot_duration_ms must be > 0")]
+    InvalidSlotDurationMs {
+        /// Configured value.
+        slot_duration_ms: u64,
+    },
+    /// Maximum transactions per produced block must be non-zero.
+    #[error("invalid node config: max_block_transactions must be > 0")]
+    InvalidMaxBlockTransactions {
+        /// Configured value.
+        max_block_transactions: usize,
+    },
     /// Pending block queue must be non-zero.
     #[error("invalid node config: max_pending_blocks must be > 0")]
     InvalidPendingBlockLimit {
@@ -248,11 +326,28 @@ pub enum NodeConfigError {
     /// Persisted state directory path is empty/whitespace.
     #[error("invalid node config: state_directory cannot be empty")]
     EmptyStateDirectory,
+    /// Producer secret key hex string is malformed.
+    #[error("invalid node config: producer_secret_key_hex is malformed ({reason})")]
+    InvalidProducerSecretKeyHex {
+        /// Human-readable parse failure reason.
+        reason: String,
+    },
+    /// Producer secret key must be exactly 32 bytes.
+    #[error(
+        "invalid node config: producer_secret_key_hex decoded length must be {expected} bytes (got {actual})"
+    )]
+    InvalidProducerSecretKeyLength {
+        /// Expected Ed25519 secret-key length.
+        expected: usize,
+        /// Actual decoded byte-length.
+        actual: usize,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::{NodeConfigError, NodeRuntimeConfig, NodeRuntimeOverrides};
+    use crate::crypto::keys::SECRET_KEY_LENGTH;
     use std::fs;
 
     fn temp_config_path(name: &str) -> std::path::PathBuf {
@@ -279,6 +374,8 @@ bootstrap = true
 strict_bootstrap = false
 min_pow_bits = 12
 event_loop_tick_ms = 300
+slot_duration_ms = 1000
+max_block_transactions = 512
 max_pending_blocks = 1024
 max_steps = 5
 state_directory = "state/devnet"
@@ -295,6 +392,8 @@ state_directory = "state/devnet"
             "loaded config should pass validation"
         );
         assert_eq!(loaded.seed_domain, "seed.devnet.homa");
+        assert_eq!(loaded.slot_duration_ms, 1000);
+        assert_eq!(loaded.max_block_transactions, 512);
         assert_eq!(loaded.max_steps, Some(5));
 
         let cleanup = fs::remove_file(path);
@@ -327,6 +426,8 @@ state_directory = "state/devnet"
             no_bootstrap: true,
             strict_bootstrap: true,
             event_loop_tick_ms: Some(999),
+            slot_duration_ms: Some(777),
+            max_block_transactions: Some(33),
             max_pending_blocks: Some(12),
             max_steps: Some(2),
             ..NodeRuntimeOverrides::default()
@@ -344,7 +445,41 @@ state_directory = "state/devnet"
             "strict bootstrap should be enabled by override"
         );
         assert_eq!(config.event_loop_tick_ms, 999);
+        assert_eq!(config.slot_duration_ms, 777);
+        assert_eq!(config.max_block_transactions, 33);
         assert_eq!(config.max_pending_blocks, 12);
         assert_eq!(config.max_steps, Some(2));
+    }
+
+    #[test]
+    fn rejects_invalid_producer_secret_key_hex() {
+        let config = NodeRuntimeConfig {
+            producer_secret_key_hex: Some("zzzz".to_owned()),
+            ..NodeRuntimeConfig::default()
+        };
+        let validation = config.validate();
+        assert!(
+            matches!(
+                validation,
+                Err(NodeConfigError::InvalidProducerSecretKeyHex { reason: _ })
+            ),
+            "malformed producer hex should be rejected"
+        );
+    }
+
+    #[test]
+    fn decodes_valid_producer_secret_key_hex() {
+        let config = NodeRuntimeConfig {
+            producer_secret_key_hex: Some(
+                "0101010101010101010101010101010101010101010101010101010101010101".to_owned(),
+            ),
+            ..NodeRuntimeConfig::default()
+        };
+        let decoded = config.producer_secret_key_bytes();
+        assert!(decoded.is_ok(), "valid producer secret key should decode");
+        assert_eq!(
+            decoded.unwrap_or(None).unwrap_or([0_u8; SECRET_KEY_LENGTH]),
+            [1_u8; SECRET_KEY_LENGTH]
+        );
     }
 }

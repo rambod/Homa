@@ -397,6 +397,21 @@ impl Mempool {
         self.get(&highest.transaction_id)
     }
 
+    /// Returns cloned transactions ordered by current priority (highest first).
+    #[must_use]
+    pub fn prioritized_transactions(&self, limit: usize) -> Vec<(TransactionId, Transaction)> {
+        self.priority_index
+            .iter()
+            .rev()
+            .take(limit)
+            .filter_map(|key| {
+                self.transactions
+                    .get(&key.transaction_id)
+                    .map(|entry| (key.transaction_id, entry.transaction.clone()))
+            })
+            .collect()
+    }
+
     /// Removes and returns the highest-priority transaction.
     pub fn pop_highest_priority(&mut self) -> Option<(TransactionId, Transaction)> {
         let highest = *self.priority_index.last()?;
@@ -966,6 +981,27 @@ mod tests {
         let popped = popped.unwrap_or_else(|| unreachable!());
         assert_eq!(popped.1.fee, 9, "highest fee entry should be popped");
         assert_eq!(mempool.len(), 1, "mempool length should decrease");
+    }
+
+    #[test]
+    fn prioritized_transactions_returns_highest_first_with_limit() {
+        let mut mempool = Mempool::new(MempoolConfig::new(16, 8, Network::Testnet));
+        let tx_low = build_valid_transaction_with(1, 1, 8);
+        let tx_high = build_valid_transaction_with(2, 7, 8);
+        let tx_mid = build_valid_transaction_with(3, 5, 8);
+
+        assert!(mempool.insert(tx_low).is_ok());
+        assert!(mempool.insert(tx_high).is_ok());
+        assert!(mempool.insert(tx_mid).is_ok());
+
+        let prioritized = mempool.prioritized_transactions(2);
+        assert_eq!(prioritized.len(), 2, "limit should cap returned entries");
+        assert!(
+            prioritized[0].1.fee >= prioritized[1].1.fee,
+            "results must be sorted by descending priority"
+        );
+        assert_eq!(prioritized[0].1.fee, 7);
+        assert_eq!(prioritized[1].1.fee, 5);
     }
 
     #[test]
