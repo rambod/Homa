@@ -169,11 +169,19 @@ fn daemon_config_from_runtime(
 
 fn initialize_daemon(runtime_config: &NodeRuntimeConfig) -> Result<NodeDaemon, NodeCliError> {
     let daemon_config = daemon_config_from_runtime(runtime_config)?;
-    let mut daemon = NodeDaemon::from_genesis_with_config(daemon_config).map_err(|source| {
-        NodeCliError::Daemon {
-            source: Box::new(source),
-        }
-    })?;
+    let mut daemon = if let Some(directory) = runtime_config.state_directory.as_deref() {
+        NodeDaemon::from_persisted_or_genesis(daemon_config, directory).map_err(|source| {
+            NodeCliError::Daemon {
+                source: Box::new(source),
+            }
+        })?
+    } else {
+        NodeDaemon::from_genesis_with_config(daemon_config).map_err(|source| {
+            NodeCliError::Daemon {
+                source: Box::new(source),
+            }
+        })?
+    };
     daemon
         .build_and_attach_swarm(P2PConfig::default())
         .map_err(|source| NodeCliError::Daemon {
@@ -271,7 +279,7 @@ fn print_daemon_report(
     let stats = daemon.stats();
     if let Some(max_steps) = max_steps {
         println!(
-            "{prefix}: steps={max_steps} swarm_events={} gossip_messages={} maintenance_ticks={} finalized_blocks={} rejected_blocks={} produced_blocks={} imported_snapshots={} quarantined_snapshots={} blocked_import_events={} tx_admitted={} tx_rejected={} blocks_finalized_total={} blocks_rejected_total={} blocks_produced_total={} block_publish_failure_total={} mempool_len={} pending_blocks={}",
+            "{prefix}: steps={max_steps} swarm_events={} gossip_messages={} maintenance_ticks={} finalized_blocks={} rejected_blocks={} produced_blocks={} imported_snapshots={} quarantined_snapshots={} blocked_import_events={} tx_admitted={} tx_rejected={} blocks_finalized_total={} blocks_rejected_total={} inbound_block_consensus_rejected_total={} inbound_block_duplicate_total={} blocks_produced_total={} block_publish_failure_total={} mempool_len={} pending_blocks={}",
             report.processed_swarm_events,
             report.processed_gossip_messages,
             report.maintenance_ticks,
@@ -285,6 +293,8 @@ fn print_daemon_report(
             stats.tx_rejected_total,
             stats.blocks_finalized_total,
             stats.block_rejected_total,
+            stats.inbound_block_consensus_rejected_total,
+            stats.inbound_block_duplicate_total,
             stats.blocks_produced_total,
             stats.block_publish_failure_total,
             daemon.mempool_len(),
@@ -294,7 +304,7 @@ fn print_daemon_report(
     }
 
     println!(
-        "{prefix}: swarm_events={} gossip_messages={} maintenance_ticks={} finalized_blocks={} rejected_blocks={} produced_blocks={} imported_snapshots={} quarantined_snapshots={} blocked_import_events={} tx_admitted={} tx_rejected={} blocks_finalized_total={} blocks_rejected_total={} blocks_produced_total={} block_publish_failure_total={} mempool_len={} pending_blocks={}",
+        "{prefix}: swarm_events={} gossip_messages={} maintenance_ticks={} finalized_blocks={} rejected_blocks={} produced_blocks={} imported_snapshots={} quarantined_snapshots={} blocked_import_events={} tx_admitted={} tx_rejected={} blocks_finalized_total={} blocks_rejected_total={} inbound_block_consensus_rejected_total={} inbound_block_duplicate_total={} blocks_produced_total={} block_publish_failure_total={} mempool_len={} pending_blocks={}",
         report.processed_swarm_events,
         report.processed_gossip_messages,
         report.maintenance_ticks,
@@ -308,6 +318,8 @@ fn print_daemon_report(
         stats.tx_rejected_total,
         stats.blocks_finalized_total,
         stats.block_rejected_total,
+        stats.inbound_block_consensus_rejected_total,
+        stats.inbound_block_duplicate_total,
         stats.blocks_produced_total,
         stats.block_publish_failure_total,
         daemon.mempool_len(),
@@ -356,8 +368,11 @@ fn flush_runtime_state_if_configured(
                     source: Box::new(source),
                 })?;
         println!(
-            "node persistence flush: state_height={} state_bytes={} sync_checkpoint_bytes={}",
-            report.state_height, report.state_snapshot_bytes, report.sync_checkpoint_bytes
+            "node persistence flush: state_height={} state_bytes={} sync_checkpoint_bytes={} finalized_block_checkpoint_bytes={}",
+            report.state_height,
+            report.state_snapshot_bytes,
+            report.sync_checkpoint_bytes,
+            report.finalized_block_checkpoint_bytes
         );
     }
     Ok(())

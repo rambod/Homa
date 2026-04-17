@@ -31,8 +31,7 @@ echo "==> audit"
 require_cargo_subcommand audit
 cargo audit \
   --ignore RUSTSEC-2024-0436 \
-  --ignore RUSTSEC-2025-0141 \
-  --ignore RUSTSEC-2026-0097
+  --ignore RUSTSEC-2025-0141
 
 echo "==> deny"
 require_cargo_subcommand deny

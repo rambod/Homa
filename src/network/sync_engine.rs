@@ -1012,6 +1012,22 @@ impl ChunkRequestScheduler {
         self.in_flight.len()
     }
 
+    /// Drops all in-flight requests during process restart recovery.
+    ///
+    /// The request-session map lives in the runtime coordinator (not in this scheduler),
+    /// so recovered in-flight requests cannot be safely replayed after restart.
+    pub fn abandon_in_flight_for_restart(&mut self) -> usize {
+        let dropped = self.in_flight.len();
+        self.in_flight.clear();
+        dropped
+    }
+
+    /// Returns scheduler policy.
+    #[must_use]
+    pub const fn policy(&self) -> RequestSchedulerPolicy {
+        self.policy
+    }
+
     /// Exports current scheduler state into a persistable checkpoint payload.
     #[must_use]
     pub fn checkpoint(&self) -> ChunkRequestSchedulerCheckpoint {
@@ -1282,6 +1298,34 @@ impl ChunkSessionManager {
     #[must_use]
     pub fn peer_in_flight_count(&self, peer_id: &str) -> usize {
         self.peer_in_flight.get(peer_id).copied().unwrap_or(0)
+    }
+
+    /// Returns total in-flight chunk count across all peers/sessions.
+    #[must_use]
+    pub fn total_in_flight_count(&self) -> usize {
+        self.peer_in_flight.values().copied().sum()
+    }
+
+    /// Drops all in-flight session-chunk state during process restart recovery.
+    ///
+    /// This preserves historical retry/backoff entries while clearing transport state that
+    /// depends on volatile request-session bindings.
+    pub fn abandon_in_flight_for_restart(&mut self) -> usize {
+        let mut dropped = 0_usize;
+        for state in self.sessions.values_mut() {
+            dropped = dropped.saturating_add(state.in_flight_chunks.len());
+            state.in_flight_chunks.clear();
+        }
+        self.peer_in_flight.clear();
+        self.sessions
+            .retain(|_, state| !state.in_flight_chunks.is_empty() || !state.retry_state.is_empty());
+        dropped
+    }
+
+    /// Returns session policy.
+    #[must_use]
+    pub const fn policy(&self) -> ChunkSessionPolicy {
+        self.policy
     }
 
     /// Exports current session manager state into a persistable checkpoint payload.
@@ -1714,6 +1758,44 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_abandon_in_flight_for_restart_clears_requests() {
+        let scheduler = ChunkRequestScheduler::new(RequestSchedulerPolicy {
+            request_timeout_ms: 100,
+            max_retries: 1,
+            max_in_flight: 4,
+        });
+        assert!(scheduler.is_ok(), "scheduler should initialize");
+        let mut scheduler = scheduler.unwrap_or_else(|_| unreachable!());
+        let chunks = sample_chunks();
+        let request = SnapshotChunkRequest {
+            request_id: 99,
+            block_height: chunks[0].block_height,
+            state_root: chunks[0].state_root,
+            snapshot_hash: chunks[0].snapshot_hash,
+            chunk_index: chunks[0].chunk_index,
+            total_chunks: chunks[0].total_chunks,
+        };
+        assert!(
+            scheduler
+                .schedule("peer-restart".to_owned(), request, 1_000)
+                .is_ok(),
+            "scheduler should accept in-flight request before restart sanitization"
+        );
+        assert_eq!(scheduler.in_flight_count(), 1);
+
+        let dropped = scheduler.abandon_in_flight_for_restart();
+        assert_eq!(
+            dropped, 1,
+            "exactly one in-flight request should be dropped"
+        );
+        assert_eq!(
+            scheduler.in_flight_count(),
+            0,
+            "scheduler should be empty after restart sanitization"
+        );
+    }
+
+    #[test]
     fn serve_limiter_blocks_peer_burst_and_allows_after_window() {
         let limiter = ChunkServeLimiter::new(ChunkServePolicy {
             per_peer_quota: 2,
@@ -2002,6 +2084,38 @@ mod tests {
             "acknowledgement should reset loss streak for next backoff cycle"
         );
         assert_eq!(retry_after_reset.unwrap_or_else(|_| unreachable!()), 1_401);
+    }
+
+    #[test]
+    fn session_manager_abandon_in_flight_for_restart_clears_transport_counters() {
+        let manager = ChunkSessionManager::new(ChunkSessionPolicy {
+            max_in_flight_per_session: 2,
+            max_in_flight_per_peer: 4,
+            base_retry_backoff_ms: 100,
+            max_retry_backoff_ms: 400,
+        });
+        assert!(manager.is_ok(), "session manager should initialize");
+        let mut manager = manager.unwrap_or_else(|_| unreachable!());
+
+        assert!(matches!(
+            manager.try_schedule_chunk("peer-r", 55, 0, 1_000),
+            Ok(SessionSchedule::Scheduled)
+        ));
+        assert_eq!(manager.peer_in_flight_count("peer-r"), 1);
+        assert_eq!(manager.total_in_flight_count(), 1);
+
+        let dropped = manager.abandon_in_flight_for_restart();
+        assert_eq!(dropped, 1, "one in-flight chunk should be dropped");
+        assert_eq!(
+            manager.peer_in_flight_count("peer-r"),
+            0,
+            "peer in-flight counter should reset after sanitization"
+        );
+        assert_eq!(
+            manager.total_in_flight_count(),
+            0,
+            "aggregate in-flight counter should reset after sanitization"
+        );
     }
 
     #[test]

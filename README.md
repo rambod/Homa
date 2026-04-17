@@ -20,6 +20,10 @@ Implemented in this repository today:
 - peer reputation, adaptive penalties, and checkpoint-trust rotation logic
 - node daemon runtime loop wiring with bounded pending-block finalization
 - deterministic local block production (slot-scheduled leader gating + self-finalization)
+- inbound block consensus admission hardening (slot leader checks, timestamp drift limits, same-slot equivocation detection)
+- proposer identity binding for blocks (signature + proposer public key + derived-address match)
+- inbound replay/continuity guards (stale-height rejection and finalized-boundary parent-hash enforcement)
+- crash-safe daemon restart recovery from persisted state snapshots + finalized-block checkpoints
 - wallet CLI for key generation and transaction broadcasting
 - deterministic chaos and fuzz testing harnesses
 
@@ -35,7 +39,7 @@ Not implemented yet (production gaps):
 - `Pure Rust` codebase with strict linting and no `unsafe`.
 - `Hybrid consensus`: deterministic stake-weighted leader election plus transaction-level PoW admission signal.
 - `Hard supply cap`: `36,000,000 HMA` (`3_600_000_000_000_000` micro-homa).
-- `Network-domain separation`: transaction and checkpoint signatures are bound to network IDs.
+- `Network-domain separation`: transaction, block proposer, and checkpoint signatures are bound to network IDs.
 - `Fast sync hardening`:
   - snapshot payload/state-root verification
   - admission limits (size/account caps)
@@ -223,6 +227,9 @@ Runtime behavior notes:
 
 - each maintenance tick processes timeout/retry feedback, then attempts bounded pending-block finalization
 - if a local producer key is configured, each new slot performs deterministic leader election and produces at most one block when local validator is elected
+- inbound blocks are consensus-gated before queueing: proposer proof verification, timestamp skew bounds, proposer-vs-slot leader check, same-slot equivocation rejection, stale-height replay rejection, and finalized-boundary parent-hash checks
+- when `state_directory` is configured, daemon startup attempts persisted restore (chain snapshot + finalized-block checkpoint) and falls back to genesis only if no persisted state exists
+- recovered sync checkpoints sanitize stranded in-flight request/chunk transport state during startup so restart never depends on volatile pre-crash request-session bindings
 - pending blocks are finalized only when height and parent hash match the current finalized tip
 - invalid/stale blocks are rejected; out-of-order future blocks are retained until parent blocks arrive
 - transactions included in finalized blocks are evicted from mempool
@@ -235,6 +242,7 @@ Runtime behavior notes:
 - Wallet and state files are written with secure file mode on Unix (`0600`).
 - Transactions include sender public key and enforce sender-address authority binding.
 - Transaction signatures are network-domain bound.
+- Block proposer signatures enforce proposer public-key/address binding in the active network domain.
 - Snapshot checkpoint signatures enforce trusted-validator thresholds.
 - Rotation updates for trusted checkpoint sets require signatures from currently active trusted validators.
 
@@ -256,6 +264,7 @@ Sync transport includes:
 - per-session/per-peer in-flight windows with deterministic backoff
 - optional strict checkpoint-aware handshake validation
 - persisted sync-session checkpoint state for restart continuity
+- restart-time sanitization of recovered in-flight transport state before runtime sync re-entry
 
 ## Testing and Fuzzing
 

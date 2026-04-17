@@ -419,3 +419,85 @@ Add deterministic proposer-driven block minting to the node runtime so elected v
 - [x] **Expansion:** Updated `src/node/daemon.rs` with local producer wiring, production metrics (`blocks_produced_total`, `block_publish_failure_total`), and production-aware maintenance/event-loop reporting.
 - [x] **Expansion:** Updated `src/node/config.rs`, `src/node/cli.rs`, `node.toml.example`, and `README.md` for producer runtime configuration and operator-facing controls.
 - [x] **Expansion:** Added regression tests for leader-slot local production, duplicate-slot no-double-produce guard, and mempool-draining local production path.
+
+---
+
+## 26. Phase 25: Inbound Block Consensus Admission Hardening (Expansion V19)
+
+Harden inbound block handling so decoded gossip payloads are consensus-screened before entering the pending-finalization queue.
+
+### Task List
+- [x] **Leader/Slot Admission Gate:** Enforce deterministic slot-leader match on inbound blocks (proposer must equal elected leader for block timestamp slot).
+- [x] **Timestamp Drift Bounds:** Reject inbound blocks that are too far ahead of local wall-clock or stale beyond finalized-tip historical tolerance.
+- [x] **Timestamp Regression Guard:** Reject non-finalized-height inbound blocks whose timestamp regresses below the finalized tip timestamp.
+- [x] **Same-Slot Equivocation Detection:** Track bounded slot commitments and reject conflicting same-slot block hashes.
+- [x] **Duplicate Block Dedupe:** Ignore duplicate same-slot blocks with identical hash to prevent queue growth amplification.
+- [x] **Abuse Feedback Integration:** Penalize peers for consensus-invalid inbound blocks via runtime reputation protocol-violation path.
+- [x] **Runtime Metrics Expansion:** Add inbound consensus-rejection and duplicate-ignore counters to daemon runtime stats and CLI reporting.
+- [x] **Expansion:** Updated `src/node/daemon.rs` with typed inbound block admission errors, bounded slot commitment tracking, and consensus validation helpers wired into block gossip ingestion.
+- [x] **Expansion:** Updated `src/node/cli.rs` runtime report output with inbound consensus rejection/duplicate counters.
+- [x] **Expansion:** Added daemon regression tests for unexpected proposer rejection, future timestamp rejection, same-slot equivocation rejection, and duplicate block dedupe behavior.
+- [x] **Expansion:** Upgraded lockfile dependency `rustls-webpki` to `0.103.12` for newly disclosed URI/wildcard constraint advisories and adjusted `cargo-deny` yanked policy to warning while upstream `libp2p` transitive `core2` yanked dependency remains unresolved.
+
+---
+
+## 27. Phase 26: Proposer Identity Binding & Signature Enforcement (Expansion V20)
+
+Bind proposer identity cryptographically so block acceptance requires a valid proposer signature and address derivation match, not only slot-schedule eligibility.
+
+### Task List
+- [x] **Block Proposer Public Key Field:** Extend block wire model with proposer public key bytes alongside proposer signature bytes.
+- [x] **Proposer Proof Validation API:** Add block-level proposer proof validation that verifies signature, enforces key/signature length, and derives proposer address for network-domain match.
+- [x] **Non-Genesis Signature Requirement:** Enforce proposer signature + proposer public key presence for non-genesis blocks.
+- [x] **Inbound Admission Proof Gate:** Apply proposer proof validation before leader/timestamp admission checks when ingesting block gossip.
+- [x] **Finalization Boundary Proof Gate:** Re-validate proposer proof at finalized-block application boundary to defend against non-gossip call paths.
+- [x] **Local Block Production Proof Completion:** Attach proposer public key with signature for locally produced blocks.
+- [x] **Expansion:** Updated `src/core/block.rs` with `proposer_public_key`, `with_proposer_proof(...)`, and `validate_proposer_proof_for_network(...)` plus new `BlockError` variants for typed proof failures.
+- [x] **Expansion:** Updated `src/node/daemon.rs` to enforce proposer proof validation in inbound admission and finalized-block application paths, and to emit proof-complete locally produced blocks.
+- [x] **Expansion:** Added regression coverage for valid proposer proof acceptance, address mismatch rejection, signature tamper rejection, missing-signature rejection, and daemon production/finalization proposer-proof assertions.
+
+---
+
+## 28. Phase 27: Inbound Replay & Parent-Continuity Guardrails (Expansion V21)
+
+Reduce inbound block queue abuse surface by rejecting stale/replayed heights and finalized-boundary parent mismatches before queue admission.
+
+### Task List
+- [x] **Stale Height Replay Rejection:** Reject inbound blocks at or below finalized tip height before queueing.
+- [x] **Finalized-Boundary Parent Check:** For next-height inbound blocks (`finalized_height + 1`), enforce exact parent hash match to finalized tip.
+- [x] **Typed Admission Errors:** Extend inbound admission error surface with stale-height and parent-mismatch variants for operator observability.
+- [x] **Peer Penalty Wiring:** Route stale-height replay and parent-mismatch rejections through protocol-violation reputation penalties.
+- [x] **Expansion:** Updated `src/node/daemon.rs` admission pipeline with `validate_inbound_block_height(...)` and typed `InboundBlockAdmissionError::{StaleHeight, FinalizedBlockHash, ParentMismatch}`.
+- [x] **Expansion:** Added daemon regression tests for stale-height replay rejection after local finalization and finalized-boundary parent mismatch rejection.
+
+---
+
+## 29. Phase 28: Crash-Restart Determinism & Startup Recovery (Expansion V22)
+
+Close daemon restart gaps by persisting finalized-block metadata and restoring runtime chain head deterministically from disk.
+
+### Task List
+- [x] **Finalized-Block Checkpoint Persistence:** Persist finalized block metadata alongside chain snapshot + sync checkpoint during graceful shutdown flush.
+- [x] **Startup Recovery Constructor:** Add daemon constructor path that restores from persisted state/checkpoints and only falls back to genesis when no persisted state exists.
+- [x] **Recovery Consistency Gate:** Reject startup when recovered state snapshot metadata and finalized-block checkpoint metadata disagree.
+- [x] **Checkpoint Corruption Surface:** Add typed daemon errors for finalized-block checkpoint missing/read/decode/write failures.
+- [x] **CLI Recovery Wiring:** Update node CLI startup to use persisted recovery automatically whenever `state_directory` is configured.
+- [x] **Expansion:** Updated `src/node/daemon.rs` with `FINALIZED_BLOCK_CHECKPOINT_FILE_NAME`, `from_persisted(...)`, `from_persisted_or_genesis(...)`, finalized-block checkpoint persistence/recovery helpers, extended `NodePersistenceReport`, and new finalized-checkpoint error variants.
+- [x] **Expansion:** Updated `src/node/cli.rs` daemon initialization path to recover from persisted state directory and expanded persistence flush output with finalized-checkpoint byte metrics.
+- [x] **Expansion:** Added daemon regression tests for persisted restart state restoration, empty-directory genesis fallback, and missing finalized-checkpoint rejection.
+
+---
+
+## 30. Phase 29: Sync Transport Restart Sanitization (Expansion V23)
+
+Eliminate restart fragility caused by persisted in-flight sync transport state that depends on volatile runtime-only request-session bindings.
+
+### Task List
+- [x] **Scheduler Restart Sanitization API:** Add typed scheduler API to abandon recovered in-flight request transport state during process restart.
+- [x] **Session Restart Sanitization API:** Add typed session-manager API to drop recovered in-flight chunk windows and reset peer transport counters while preserving retry-history entries.
+- [x] **Daemon Recovery Hardening:** Update daemon persisted-startup sync recovery path to sanitize recovered in-flight transport state instead of hard-failing startup.
+- [x] **Post-Restart Operability Test:** Add daemon regression proving startup recovery succeeds with persisted in-flight sync state and that new outbound scheduling remains operational after sanitization.
+- [x] **Transport Sanitization Unit Tests:** Add sync-engine unit coverage for scheduler/session restart sanitization behavior and counter reset guarantees.
+- [x] **Expansion:** Updated `src/network/sync_engine.rs` with `abandon_in_flight_for_restart(...)` APIs on `ChunkRequestScheduler` and `ChunkSessionManager` plus targeted tests.
+- [x] **Expansion:** Updated `src/node/daemon.rs` recovered-sync path to sanitize recovered in-flight transport state and continue deterministic startup recovery.
+- [x] **Expansion:** Replaced the previous startup-rejection regression with restart-sanitization coverage in daemon tests.

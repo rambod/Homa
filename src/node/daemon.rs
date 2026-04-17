@@ -1,6 +1,7 @@
 //! Node daemon skeleton and runtime event-loop wiring.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
+use std::fs;
 use std::path::Path;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -18,7 +19,9 @@ use crate::core::genesis::{
     GENESIS_TIMESTAMP_UNIX_MS, GenesisError, default_genesis_allocations, forge_genesis,
 };
 use crate::core::mempool::{Mempool, MempoolConfig, MempoolError, TransactionId, transaction_id};
-use crate::core::recovery::{RecoveryError, RecoveryPaths, commit_state_snapshot_atomic};
+use crate::core::recovery::{
+    RecoveryError, RecoveryPaths, commit_state_snapshot_atomic, recover_chain_state,
+};
 use crate::core::state::ChainState;
 use crate::core::state::StateError;
 use crate::core::sync::{SnapshotAdmissionPolicy, SnapshotImportMode};
@@ -42,6 +45,7 @@ use crate::network::runtime_policy::{RuntimePolicyError, SyncRuntimePolicyContro
 use crate::network::sync_engine::{ChunkServePolicy, ChunkSessionPolicy, RequestSchedulerPolicy};
 use crate::network::sync_engine::{
     SyncEngineError, SyncSessionCheckpointPaths, persist_sync_runtime_checkpoint,
+    recover_sync_runtime_checkpoint,
 };
 use crate::network::sync_runtime::{
     SnapshotImportFailurePolicy, SyncRuntimeCoordinator, SyncRuntimeError,
@@ -60,6 +64,14 @@ pub const DEFAULT_MAX_BLOCK_TRANSACTIONS: usize = 1_024;
 const NORMALIZED_GENESIS_STAKE_SCALE: u64 = 10_000;
 /// Maximum publish attempts for one locally produced block.
 const BLOCK_PUBLISH_MAX_ATTEMPTS: usize = 3;
+/// Canonical persisted finalized-block checkpoint filename.
+pub const FINALIZED_BLOCK_CHECKPOINT_FILE_NAME: &str = "finalized_block.checkpoint";
+/// Maximum allowed inbound block future skew measured in slot intervals.
+const MAX_INBOUND_BLOCK_FUTURE_SLOTS: u64 = 2;
+/// Maximum accepted inbound block historical skew behind finalized tip.
+const MAX_INBOUND_BLOCK_PAST_SLOTS: u64 = 128;
+/// Bounded tracked slot-commitments used to detect same-slot equivocation attempts.
+const MAX_TRACKED_INBOUND_SLOT_COMMITMENTS: usize = 8_192;
 
 /// Node daemon runtime configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,6 +200,10 @@ pub struct NodeRuntimeStats {
     pub blocks_finalized_total: u64,
     /// Number of pending blocks rejected during finalization checks.
     pub block_rejected_total: u64,
+    /// Number of inbound blocks rejected by consensus admission gates.
+    pub inbound_block_consensus_rejected_total: u64,
+    /// Number of inbound duplicate blocks ignored after slot-commitment match.
+    pub inbound_block_duplicate_total: u64,
     /// Number of blocks successfully produced by local validator.
     pub blocks_produced_total: u64,
     /// Number of produced block publish failures.
@@ -261,6 +277,8 @@ pub struct NodePersistenceReport {
     pub state_snapshot_bytes: usize,
     /// Number of encoded sync checkpoint bytes written.
     pub sync_checkpoint_bytes: usize,
+    /// Number of encoded finalized-block checkpoint bytes written.
+    pub finalized_block_checkpoint_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -272,6 +290,77 @@ struct NodePendingBlockProcessingReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct NodeBlockProductionReport {
     produced_blocks: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum InboundBlockAdmissionError {
+    #[error("inbound block proposer proof validation failed: {source}")]
+    ProposerProof { source: BlockError },
+    #[error("inbound block leader election failed: {source}")]
+    LeaderElection { source: LeaderElectionError },
+    #[error(
+        "inbound block height is stale: block_height={block_height}, finalized_height={finalized_height}"
+    )]
+    StaleHeight {
+        block_height: u64,
+        finalized_height: u64,
+    },
+    #[error("inbound block finalized parent hash computation failed: {source}")]
+    FinalizedBlockHash { source: BlockError },
+    #[error(
+        "inbound block parent mismatch at finalized boundary for height {block_height}: expected_parent={expected_parent_hash:?}, observed_parent={observed_parent_hash:?}"
+    )]
+    ParentMismatch {
+        block_height: u64,
+        expected_parent_hash: [u8; 32],
+        observed_parent_hash: [u8; 32],
+    },
+    #[error(
+        "inbound block timestamp is too far in the future: block={block_timestamp_unix_ms}, now={now_unix_ms}, max_allowed={max_allowed_unix_ms}"
+    )]
+    FutureTimestamp {
+        block_timestamp_unix_ms: u64,
+        now_unix_ms: u64,
+        max_allowed_unix_ms: u64,
+    },
+    #[error(
+        "inbound block timestamp is stale: block={block_timestamp_unix_ms}, min_allowed={min_allowed_unix_ms}"
+    )]
+    StaleTimestamp {
+        block_timestamp_unix_ms: u64,
+        min_allowed_unix_ms: u64,
+    },
+    #[error(
+        "inbound block timestamp regressed below finalized tip: finalized={finalized_timestamp_unix_ms}, block={block_timestamp_unix_ms}"
+    )]
+    TimestampRegression {
+        finalized_timestamp_unix_ms: u64,
+        block_timestamp_unix_ms: u64,
+    },
+    #[error(
+        "inbound block proposer does not match elected leader for slot {slot}: expected={expected_leader}, observed={observed_proposer}"
+    )]
+    UnexpectedProposer {
+        slot: u64,
+        expected_leader: String,
+        observed_proposer: String,
+    },
+    #[error("inbound block hash computation failed: {source}")]
+    BlockHash { source: BlockError },
+    #[error(
+        "inbound block equivocation detected for slot {slot}: existing={existing_block_hash:?}, observed={observed_block_hash:?}"
+    )]
+    Equivocation {
+        slot: u64,
+        existing_block_hash: [u8; 32],
+        observed_block_hash: [u8; 32],
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboundBlockQueueAction {
+    Queue,
+    Duplicate,
 }
 
 impl NodeEventLoopReport {
@@ -384,6 +473,18 @@ pub enum NodeDaemonError {
         /// Underlying block error.
         source: BlockError,
     },
+    /// Inbound block failed consensus-admission hardening checks.
+    #[error("node daemon inbound block rejected by consensus admission: {source}")]
+    BlockAdmission {
+        /// Underlying consensus-admission rejection.
+        source: InboundBlockAdmissionError,
+    },
+    /// Block failed proposer proof validation at finalization boundary.
+    #[error("node daemon block proposer proof validation failed: {source}")]
+    BlockConsensus {
+        /// Underlying block validation error.
+        source: BlockError,
+    },
     /// Produced block construction failed.
     #[error("node daemon block production failed: {source}")]
     BlockBuild {
@@ -426,6 +527,74 @@ pub enum NodeDaemonError {
         /// Underlying sync-engine checkpoint error.
         source: SyncEngineError,
     },
+    /// Finalized-block checkpoint encoding failed.
+    #[error("node daemon finalized-block checkpoint encoding failed: {source}")]
+    FinalizedBlockCheckpointEncode {
+        /// Underlying block codec error.
+        source: BlockError,
+    },
+    /// Finalized-block checkpoint write failed.
+    #[error("node daemon finalized-block checkpoint write failed: {path}")]
+    FinalizedBlockCheckpointWrite {
+        /// Checkpoint file path.
+        path: String,
+        /// Underlying I/O error.
+        source: std::io::Error,
+    },
+    /// Finalized-block checkpoint read failed.
+    #[error("node daemon finalized-block checkpoint read failed: {path}")]
+    FinalizedBlockCheckpointRead {
+        /// Checkpoint file path.
+        path: String,
+        /// Underlying I/O error.
+        source: std::io::Error,
+    },
+    /// Finalized-block checkpoint is missing.
+    #[error("node daemon finalized-block checkpoint is missing: {path}")]
+    MissingFinalizedBlockCheckpoint {
+        /// Checkpoint file path.
+        path: String,
+    },
+    /// Finalized-block checkpoint decode failed.
+    #[error("node daemon finalized-block checkpoint decode failed: {source}")]
+    FinalizedBlockCheckpointDecode {
+        /// Underlying block decode error.
+        source: BlockError,
+    },
+    /// Recovered state snapshot metadata mismatches recovered finalized-block checkpoint.
+    #[error(
+        "node daemon recovered state/finalized checkpoint mismatch: recovered_height={recovered_height}, finalized_height={finalized_height}, recovered_state_root={recovered_state_root:?}, finalized_state_root={finalized_state_root:?}"
+    )]
+    RecoveredFinalizedMismatch {
+        /// Height recovered from state snapshot.
+        recovered_height: u64,
+        /// Height encoded in finalized-block checkpoint.
+        finalized_height: u64,
+        /// State root recovered from state snapshot.
+        recovered_state_root: [u8; 32],
+        /// State root encoded in finalized-block checkpoint.
+        finalized_state_root: [u8; 32],
+    },
+    /// Recovered sync checkpoint scheduler policy mismatches daemon config policy.
+    #[error(
+        "node daemon recovered sync scheduler policy mismatch: expected={expected:?}, recovered={recovered:?}"
+    )]
+    RecoveredSyncSchedulerPolicyMismatch {
+        /// Scheduler policy from daemon config.
+        expected: RequestSchedulerPolicy,
+        /// Scheduler policy from recovered sync checkpoint.
+        recovered: RequestSchedulerPolicy,
+    },
+    /// Recovered sync checkpoint session policy mismatches daemon config policy.
+    #[error(
+        "node daemon recovered sync session policy mismatch: expected={expected:?}, recovered={recovered:?}"
+    )]
+    RecoveredSyncSessionPolicyMismatch {
+        /// Session policy from daemon config.
+        expected: ChunkSessionPolicy,
+        /// Session policy from recovered sync checkpoint.
+        recovered: ChunkSessionPolicy,
+    },
     /// Swarm-backed event loop was requested without attached swarm.
     #[error("node daemon has no attached swarm")]
     MissingSwarm,
@@ -452,6 +621,8 @@ pub struct NodeDaemon {
     finalized_block: Block,
     mempool: Mempool,
     pending_blocks: VecDeque<Block>,
+    inbound_slot_commitments: BTreeMap<u64, [u8; 32]>,
+    inbound_slot_commitment_order: VecDeque<u64>,
     observability: Observability,
     stats: NodeRuntimeStats,
     swarm: Option<Swarm<HomaBehaviour>>,
@@ -476,6 +647,10 @@ impl std::fmt::Debug for NodeDaemon {
             .field("finalized_block", &self.finalized_block)
             .field("mempool", &self.mempool)
             .field("pending_blocks", &self.pending_blocks)
+            .field(
+                "inbound_slot_commitments",
+                &self.inbound_slot_commitments.len(),
+            )
             .field("observability", &self.observability)
             .field("stats", &self.stats)
             .field("swarm_attached", &self.swarm.is_some())
@@ -503,6 +678,55 @@ impl NodeDaemon {
             trusted_set,
             stake_ledger,
         )
+    }
+
+    /// Creates a daemon from persisted state when available, otherwise bootstraps from genesis.
+    pub fn from_persisted_or_genesis(
+        config: NodeDaemonConfig,
+        directory: &Path,
+    ) -> Result<Self, NodeDaemonError> {
+        match Self::from_persisted(config, directory) {
+            Ok(daemon) => Ok(daemon),
+            Err(NodeDaemonError::Recovery {
+                source: RecoveryError::NoPersistedState,
+            }) => Self::from_genesis_with_config(config),
+            Err(source) => Err(source),
+        }
+    }
+
+    /// Creates a daemon from persisted chain-state and finalized-block checkpoints.
+    pub fn from_persisted(
+        config: NodeDaemonConfig,
+        directory: &Path,
+    ) -> Result<Self, NodeDaemonError> {
+        let recovery_paths = RecoveryPaths::new(directory.to_path_buf());
+        let recovered = recover_chain_state(config.network, &recovery_paths)
+            .map_err(|source| NodeDaemonError::Recovery { source })?;
+        let finalized_block = recover_finalized_block_checkpoint(directory)?;
+        if finalized_block.header.height != recovered.block_height
+            || finalized_block.header.state_root != recovered.state_root
+        {
+            return Err(NodeDaemonError::RecoveredFinalizedMismatch {
+                recovered_height: recovered.block_height,
+                finalized_height: finalized_block.header.height,
+                recovered_state_root: recovered.state_root,
+                finalized_state_root: finalized_block.header.state_root,
+            });
+        }
+
+        let trusted_set = trusted_checkpoint_set_from_genesis(config.network)?;
+        let stake_ledger = stake_ledger_from_genesis(config.network)?;
+        let mut daemon = Self::new(
+            config,
+            finalized_block,
+            recovered.state,
+            trusted_set,
+            stake_ledger,
+        )?;
+        if let Some(sync_runtime) = recover_sync_runtime_for_daemon(&config, directory)? {
+            daemon.sync_runtime = sync_runtime;
+        }
+        Ok(daemon)
     }
 
     /// Creates a daemon from explicit runtime config and initialized state.
@@ -559,6 +783,8 @@ impl NodeDaemon {
             finalized_block,
             mempool,
             pending_blocks: VecDeque::new(),
+            inbound_slot_commitments: BTreeMap::new(),
+            inbound_slot_commitment_order: VecDeque::new(),
             observability,
             stats: NodeRuntimeStats::default(),
             swarm: None,
@@ -691,11 +917,34 @@ impl NodeDaemon {
                     );
                     NodeDaemonError::BlockDecode { source }
                 })?;
+                let queue_action =
+                    self.admit_inbound_block_consensus(&block, now_ms)
+                        .map_err(|source| {
+                            self.stats.inbound_block_consensus_rejected_total = self
+                                .stats
+                                .inbound_block_consensus_rejected_total
+                                .saturating_add(1);
+                            self.controller.record_peer_event(
+                                peer_id,
+                                ReputationEvent::ProtocolViolation,
+                                now_ms,
+                            );
+                            NodeDaemonError::BlockAdmission { source }
+                        })?;
                 let height = block.header.height;
-                self.enqueue_pending_block(block);
-                self.stats.blocks_queued_total = self.stats.blocks_queued_total.saturating_add(1);
-                self.controller
-                    .record_peer_event(peer_id, ReputationEvent::HelpfulRelay, now_ms);
+                if queue_action == InboundBlockQueueAction::Queue {
+                    self.enqueue_pending_block(block);
+                    self.stats.blocks_queued_total =
+                        self.stats.blocks_queued_total.saturating_add(1);
+                    self.controller.record_peer_event(
+                        peer_id,
+                        ReputationEvent::HelpfulRelay,
+                        now_ms,
+                    );
+                } else {
+                    self.stats.inbound_block_duplicate_total =
+                        self.stats.inbound_block_duplicate_total.saturating_add(1);
+                }
                 Ok(NodeInboundOutcome::BlockQueued { height })
             }
             InboundGossipAction::SyncChunkRequest(request) => {
@@ -819,14 +1068,19 @@ impl NodeDaemon {
             return Ok(NodeBlockProductionReport::default());
         };
 
-        let signature = self
+        let (signature, public_key) = self
             .local_block_producer
             .as_ref()
-            .map(|producer| producer.keypair.sign(&signing_bytes))
+            .map(|producer| {
+                (
+                    producer.keypair.sign(&signing_bytes),
+                    producer.keypair.public_key_bytes(),
+                )
+            })
             .ok_or_else(|| NodeDaemonError::ProducerNotStaked {
                 address: producer_address.clone(),
             })?;
-        let produced_block = candidate_block.with_proposer_signature(signature);
+        let produced_block = candidate_block.with_proposer_proof(signature, public_key);
         if self.apply_finalized_block(produced_block.clone()).is_err() {
             let _ = record_slot_observation(&self.observability, slot, &producer_address, None);
             self.stats.block_rejected_total = self.stats.block_rejected_total.saturating_add(1);
@@ -914,7 +1168,149 @@ impl NodeDaemon {
         Ok(selected)
     }
 
+    fn admit_inbound_block_consensus(
+        &mut self,
+        block: &Block,
+        now_ms: u64,
+    ) -> Result<InboundBlockQueueAction, InboundBlockAdmissionError> {
+        block
+            .validate_proposer_proof_for_network(self.config.network)
+            .map_err(|source| InboundBlockAdmissionError::ProposerProof { source })?;
+        self.validate_inbound_block_height(block)?;
+
+        let slot =
+            slot_from_timestamp(block.header.timestamp_unix_ms, self.config.slot_duration_ms);
+        self.validate_inbound_block_timestamp(block, now_ms)?;
+
+        let leader_selection = elect_leader(&self.stake_ledger, slot)
+            .map_err(|source| InboundBlockAdmissionError::LeaderElection { source })?;
+        if leader_selection.leader != block.header.proposer {
+            let _ = record_slot_observation(
+                &self.observability,
+                slot,
+                &leader_selection.leader,
+                Some(&block.header.proposer),
+            );
+            return Err(InboundBlockAdmissionError::UnexpectedProposer {
+                slot,
+                expected_leader: leader_selection.leader,
+                observed_proposer: block.header.proposer.clone(),
+            });
+        }
+
+        let block_hash = block
+            .hash()
+            .map_err(|source| InboundBlockAdmissionError::BlockHash { source })?;
+        self.register_inbound_slot_commitment(slot, block_hash)
+    }
+
+    fn validate_inbound_block_height(
+        &self,
+        block: &Block,
+    ) -> Result<(), InboundBlockAdmissionError> {
+        let finalized_height = self.finalized_block.header.height;
+        if block.header.height <= finalized_height {
+            return Err(InboundBlockAdmissionError::StaleHeight {
+                block_height: block.header.height,
+                finalized_height,
+            });
+        }
+
+        if block.header.height == finalized_height.saturating_add(1) {
+            let expected_parent_hash = self
+                .finalized_block
+                .hash()
+                .map_err(|source| InboundBlockAdmissionError::FinalizedBlockHash { source })?;
+            if block.header.previous_block_hash != expected_parent_hash {
+                return Err(InboundBlockAdmissionError::ParentMismatch {
+                    block_height: block.header.height,
+                    expected_parent_hash,
+                    observed_parent_hash: block.header.previous_block_hash,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    const fn validate_inbound_block_timestamp(
+        &self,
+        block: &Block,
+        now_ms: u64,
+    ) -> Result<(), InboundBlockAdmissionError> {
+        let max_future = now_ms.saturating_add(
+            self.config
+                .slot_duration_ms
+                .saturating_mul(MAX_INBOUND_BLOCK_FUTURE_SLOTS),
+        );
+        if block.header.timestamp_unix_ms > max_future {
+            return Err(InboundBlockAdmissionError::FutureTimestamp {
+                block_timestamp_unix_ms: block.header.timestamp_unix_ms,
+                now_unix_ms: now_ms,
+                max_allowed_unix_ms: max_future,
+            });
+        }
+
+        let min_timestamp = self
+            .finalized_block
+            .header
+            .timestamp_unix_ms
+            .saturating_sub(
+                self.config
+                    .slot_duration_ms
+                    .saturating_mul(MAX_INBOUND_BLOCK_PAST_SLOTS),
+            );
+        if block.header.timestamp_unix_ms < min_timestamp {
+            return Err(InboundBlockAdmissionError::StaleTimestamp {
+                block_timestamp_unix_ms: block.header.timestamp_unix_ms,
+                min_allowed_unix_ms: min_timestamp,
+            });
+        }
+
+        if block.header.height > self.finalized_block.header.height
+            && block.header.timestamp_unix_ms < self.finalized_block.header.timestamp_unix_ms
+        {
+            return Err(InboundBlockAdmissionError::TimestampRegression {
+                finalized_timestamp_unix_ms: self.finalized_block.header.timestamp_unix_ms,
+                block_timestamp_unix_ms: block.header.timestamp_unix_ms,
+            });
+        }
+
+        Ok(())
+    }
+
+    fn register_inbound_slot_commitment(
+        &mut self,
+        slot: u64,
+        block_hash: [u8; 32],
+    ) -> Result<InboundBlockQueueAction, InboundBlockAdmissionError> {
+        if let Some(existing_hash) = self.inbound_slot_commitments.get(&slot).copied() {
+            if existing_hash == block_hash {
+                return Ok(InboundBlockQueueAction::Duplicate);
+            }
+            return Err(InboundBlockAdmissionError::Equivocation {
+                slot,
+                existing_block_hash: existing_hash,
+                observed_block_hash: block_hash,
+            });
+        }
+
+        self.inbound_slot_commitments.insert(slot, block_hash);
+        self.inbound_slot_commitment_order.push_back(slot);
+        while self.inbound_slot_commitment_order.len() > MAX_TRACKED_INBOUND_SLOT_COMMITMENTS {
+            let Some(evicted_slot) = self.inbound_slot_commitment_order.pop_front() else {
+                break;
+            };
+            let _ = self.inbound_slot_commitments.remove(&evicted_slot);
+        }
+        Ok(InboundBlockQueueAction::Queue)
+    }
+
     fn apply_finalized_block(&mut self, block: Block) -> Result<(), NodeDaemonError> {
+        block
+            .validate_proposer_proof_for_network(self.config.network)
+            .map_err(|source| NodeDaemonError::BlockConsensus { source })?;
+
         let mut next_state = self.chain_state.clone();
         next_state
             .apply_block(&block)
@@ -1124,11 +1520,14 @@ impl NodeDaemon {
             &sync_paths,
         )
         .map_err(|source| NodeDaemonError::SyncCheckpoint { source })?;
+        let finalized_block_checkpoint_bytes =
+            persist_finalized_block_checkpoint(&self.finalized_block, directory)?;
 
         Ok(NodePersistenceReport {
             state_height: state_commit.block_height,
             state_snapshot_bytes: state_commit.bytes_written,
             sync_checkpoint_bytes,
+            finalized_block_checkpoint_bytes,
         })
     }
 
@@ -1340,16 +1739,122 @@ fn now_unix_ms() -> u64 {
         })
 }
 
+fn finalized_block_checkpoint_path(directory: &Path) -> std::path::PathBuf {
+    directory.join(FINALIZED_BLOCK_CHECKPOINT_FILE_NAME)
+}
+
+fn persist_finalized_block_checkpoint(
+    finalized_block: &Block,
+    directory: &Path,
+) -> Result<usize, NodeDaemonError> {
+    let encoded = finalized_block
+        .encode()
+        .map_err(|source| NodeDaemonError::FinalizedBlockCheckpointEncode { source })?;
+    let checkpoint_path = finalized_block_checkpoint_path(directory);
+    let path_display = checkpoint_path.to_string_lossy().into_owned();
+    if let Some(parent) = checkpoint_path.parent() {
+        fs::create_dir_all(parent).map_err(|source| {
+            NodeDaemonError::FinalizedBlockCheckpointWrite {
+                path: path_display.clone(),
+                source,
+            }
+        })?;
+    }
+
+    let unique_suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0_u128, |duration| duration.as_nanos());
+    let temporary_path = checkpoint_path.with_extension(format!(
+        "checkpoint.tmp.{}.{unique_suffix}",
+        std::process::id()
+    ));
+    let temporary_display = temporary_path.to_string_lossy().into_owned();
+    fs::write(&temporary_path, &encoded).map_err(|source| {
+        NodeDaemonError::FinalizedBlockCheckpointWrite {
+            path: temporary_display.clone(),
+            source,
+        }
+    })?;
+    fs::rename(&temporary_path, &checkpoint_path).map_err(|source| {
+        NodeDaemonError::FinalizedBlockCheckpointWrite {
+            path: path_display,
+            source,
+        }
+    })?;
+    Ok(encoded.len())
+}
+
+fn recover_finalized_block_checkpoint(directory: &Path) -> Result<Block, NodeDaemonError> {
+    let checkpoint_path = finalized_block_checkpoint_path(directory);
+    let path_display = checkpoint_path.to_string_lossy().into_owned();
+    let bytes = match fs::read(&checkpoint_path) {
+        Ok(bytes) => bytes,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Err(NodeDaemonError::MissingFinalizedBlockCheckpoint { path: path_display });
+        }
+        Err(source) => {
+            return Err(NodeDaemonError::FinalizedBlockCheckpointRead {
+                path: path_display,
+                source,
+            });
+        }
+    };
+
+    Block::decode(&bytes)
+        .map_err(|source| NodeDaemonError::FinalizedBlockCheckpointDecode { source })
+}
+
+fn recover_sync_runtime_for_daemon(
+    config: &NodeDaemonConfig,
+    directory: &Path,
+) -> Result<Option<SyncRuntimeCoordinator>, NodeDaemonError> {
+    let paths = SyncSessionCheckpointPaths::new(directory.to_path_buf());
+    let recovered = recover_sync_runtime_checkpoint(&paths)
+        .map_err(|source| NodeDaemonError::SyncCheckpoint { source })?;
+    let Some((mut scheduler, mut session_manager)) = recovered else {
+        return Ok(None);
+    };
+
+    if scheduler.policy() != config.request_policy {
+        return Err(NodeDaemonError::RecoveredSyncSchedulerPolicyMismatch {
+            expected: config.request_policy,
+            recovered: scheduler.policy(),
+        });
+    }
+    if session_manager.policy() != config.session_policy {
+        return Err(NodeDaemonError::RecoveredSyncSessionPolicyMismatch {
+            expected: config.session_policy,
+            recovered: session_manager.policy(),
+        });
+    }
+
+    let _ = scheduler.abandon_in_flight_for_restart();
+    let _ = session_manager.abandon_in_flight_for_restart();
+
+    let sync_runtime = SyncRuntimeCoordinator::with_recovered_transport_state(
+        scheduler,
+        session_manager,
+        config.snapshot_chunk_bytes,
+        config.snapshot_admission_policy,
+        config.snapshot_import_failure_policy,
+    )
+    .map_err(|source| NodeDaemonError::SyncRuntimeConfig { source })?;
+
+    Ok(Some(sync_runtime))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_SLOT_DURATION_MS, NodeDaemon, NodeDaemonConfig, NodeDaemonError,
-        NodeInboundOutcome, stake_ledger_from_genesis, trusted_checkpoint_set_from_genesis,
+        DEFAULT_SLOT_DURATION_MS, FINALIZED_BLOCK_CHECKPOINT_FILE_NAME, InboundBlockAdmissionError,
+        NodeDaemon, NodeDaemonConfig, NodeDaemonError, NodeInboundOutcome,
+        stake_ledger_from_genesis, trusted_checkpoint_set_from_genesis,
     };
     use crate::consensus::leader::elect_leader;
     use crate::core::block::{Block, BlockHeader};
-    use crate::core::genesis::GENESIS_TIMESTAMP_UNIX_MS;
-    use crate::core::genesis::forge_genesis;
+    use crate::core::genesis::{
+        GENESIS_TIMESTAMP_UNIX_MS, default_genesis_allocations, forge_genesis,
+    };
     use crate::core::mempool::MempoolConfig;
     use crate::core::recovery::SNAPSHOT_FILE_NAME;
     use crate::core::sync::{build_state_snapshot, split_snapshot_into_chunks};
@@ -1364,6 +1869,7 @@ mod tests {
     use crate::network::runtime_loop::RuntimeLoopError;
     use crate::network::sync_engine::SYNC_SESSION_CHECKPOINT_FILE_NAME;
     use std::fs;
+    use std::path::PathBuf;
 
     fn daemon_with_low_pow(network: Network) -> NodeDaemon {
         let mut config = NodeDaemonConfig::for_network(network);
@@ -1414,6 +1920,16 @@ mod tests {
         daemon.unwrap_or_else(|_| unreachable!())
     }
 
+    fn test_directory(prefix: &str) -> PathBuf {
+        let mut directory = std::env::temp_dir();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0_u128, |duration| duration.as_nanos());
+        directory.push(format!("{prefix}-{}-{unique}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        directory
+    }
+
     fn producer_address(network: Network) -> String {
         let keypair = Keypair::from_secret_key(&[1_u8; 32]);
         assert!(keypair.is_ok(), "producer key should parse");
@@ -1437,6 +1953,39 @@ mod tests {
         }
 
         unreachable!("leader slot should be found within bounded search window");
+    }
+
+    fn leader_for_slot(network: Network, slot: u64) -> String {
+        let ledger = stake_ledger_from_genesis(network);
+        assert!(ledger.is_ok(), "stake ledger should build");
+        let ledger = ledger.unwrap_or_else(|_| unreachable!());
+        let selected = elect_leader(&ledger, slot);
+        assert!(selected.is_ok(), "leader election should succeed");
+        selected.unwrap_or_else(|_| unreachable!()).leader
+    }
+
+    fn validator_keypair_for_address(network: Network, validator_address: &str) -> Keypair {
+        for seed in [1_u8, 2_u8, 3_u8] {
+            let keypair = Keypair::from_secret_key(&[seed; 32]);
+            assert!(keypair.is_ok(), "seeded validator key should parse");
+            let keypair = keypair.unwrap_or_else(|_| unreachable!());
+            let derived = derive_address(&keypair.public_key_bytes(), network);
+            assert!(derived.is_ok(), "validator address should derive");
+            if derived.unwrap_or_else(|_| unreachable!()) == validator_address {
+                return keypair;
+            }
+        }
+        unreachable!("validator address should map to deterministic genesis keypair");
+    }
+
+    fn sign_block_for_proposer(network: Network, block: Block) -> Block {
+        let keypair = validator_keypair_for_address(network, &block.header.proposer);
+        let signing_bytes = block.header_signing_bytes();
+        assert!(signing_bytes.is_ok(), "block signing bytes should build");
+        block.with_proposer_proof(
+            keypair.sign(&signing_bytes.unwrap_or_else(|_| unreachable!())),
+            keypair.public_key_bytes(),
+        )
     }
 
     fn timestamp_for_slot(slot: u64, slot_duration_ms: u64) -> u64 {
@@ -1509,19 +2058,25 @@ mod tests {
             .with_signature(sender_keypair.sign(&signing_bytes.unwrap_or_else(|_| unreachable!())))
     }
 
-    fn empty_child_block(parent: &Block, state_root: [u8; 32], proposer: String) -> Block {
+    fn empty_child_block(
+        network: Network,
+        parent: &Block,
+        state_root: [u8; 32],
+        timestamp_unix_ms: u64,
+        proposer: String,
+    ) -> Block {
         let parent_hash = parent.hash();
         assert!(parent_hash.is_ok(), "parent hash should compute");
         let header = BlockHeader::new(
             parent.header.height.saturating_add(1),
             parent_hash.unwrap_or_else(|_| unreachable!()),
             state_root,
-            parent.header.timestamp_unix_ms.saturating_add(1),
+            timestamp_unix_ms,
             proposer,
         );
         let block = Block::new_unsigned(header, Vec::new());
         assert!(block.is_ok(), "empty child block should build");
-        block.unwrap_or_else(|_| unreachable!())
+        sign_block_for_proposer(network, block.unwrap_or_else(|_| unreachable!()))
     }
 
     #[test]
@@ -1638,14 +2193,312 @@ mod tests {
     }
 
     #[test]
+    fn inbound_block_rejects_unexpected_slot_proposer_and_penalizes_peer() {
+        let network = Network::Testnet;
+        let mut daemon = daemon_with_low_pow(network);
+        let slot = 0_u64;
+        let timestamp_unix_ms = timestamp_for_slot(slot, DEFAULT_SLOT_DURATION_MS);
+        let expected_leader = leader_for_slot(network, slot);
+        let allocations = default_genesis_allocations(network);
+        assert!(allocations.is_ok(), "genesis allocations should build");
+        let unexpected_proposer = allocations
+            .unwrap_or_else(|_| unreachable!())
+            .into_iter()
+            .map(|(address, _)| address)
+            .find(|address| address != &expected_leader)
+            .unwrap_or_else(|| unreachable!());
+
+        let block = empty_child_block(
+            network,
+            daemon.finalized_block(),
+            daemon.chain_state().state_root(),
+            timestamp_unix_ms,
+            unexpected_proposer,
+        );
+        let payload = block.encode();
+        assert!(payload.is_ok(), "block should encode");
+        let handled = daemon.handle_inbound_gossip_message(
+            BLOCKS_TOPIC,
+            &payload.unwrap_or_else(|_| unreachable!()),
+            "peer-wrong-proposer",
+            timestamp_unix_ms,
+        );
+        assert!(
+            matches!(
+                handled,
+                Err(NodeDaemonError::BlockAdmission {
+                    source: InboundBlockAdmissionError::UnexpectedProposer { slot: 0, .. }
+                })
+            ),
+            "unexpected proposer must be rejected at inbound admission boundary"
+        );
+        assert_eq!(daemon.pending_block_count(), 0);
+        assert_eq!(daemon.stats().inbound_block_consensus_rejected_total, 1);
+        assert_eq!(
+            daemon.peer_score("peer-wrong-proposer", timestamp_unix_ms + 1),
+            -50
+        );
+    }
+
+    #[test]
+    fn inbound_block_rejects_excessive_future_timestamp() {
+        let network = Network::Testnet;
+        let mut daemon = daemon_with_low_pow(network);
+        let slot = 10_u64;
+        let block_timestamp = timestamp_for_slot(slot, DEFAULT_SLOT_DURATION_MS);
+        let proposer = leader_for_slot(network, slot);
+        let block = empty_child_block(
+            network,
+            daemon.finalized_block(),
+            daemon.chain_state().state_root(),
+            block_timestamp,
+            proposer,
+        );
+        let payload = block.encode();
+        assert!(payload.is_ok(), "block should encode");
+
+        let now_ms = GENESIS_TIMESTAMP_UNIX_MS.saturating_add(1);
+        let handled = daemon.handle_inbound_gossip_message(
+            BLOCKS_TOPIC,
+            &payload.unwrap_or_else(|_| unreachable!()),
+            "peer-future-block",
+            now_ms,
+        );
+        assert!(
+            matches!(
+                handled,
+                Err(NodeDaemonError::BlockAdmission {
+                    source: InboundBlockAdmissionError::FutureTimestamp { .. }
+                })
+            ),
+            "far-future block timestamps must be rejected"
+        );
+        assert_eq!(daemon.pending_block_count(), 0);
+        assert_eq!(daemon.stats().inbound_block_consensus_rejected_total, 1);
+        assert_eq!(daemon.peer_score("peer-future-block", now_ms + 1), -50);
+    }
+
+    #[test]
+    fn inbound_block_rejects_stale_height_replay_and_penalizes_peer() {
+        let network = Network::Testnet;
+        let mut daemon = daemon_with_low_pow(network);
+        let slot = 0_u64;
+        let timestamp_unix_ms = timestamp_for_slot(slot, DEFAULT_SLOT_DURATION_MS);
+        let proposer = leader_for_slot(network, slot);
+        let block = empty_child_block(
+            network,
+            daemon.finalized_block(),
+            daemon.chain_state().state_root(),
+            timestamp_unix_ms,
+            proposer,
+        );
+        let payload = block.encode();
+        assert!(payload.is_ok(), "block should encode");
+        let payload = payload.unwrap_or_else(|_| unreachable!());
+        let queued = daemon.handle_inbound_gossip_message(
+            BLOCKS_TOPIC,
+            &payload,
+            "peer-first",
+            timestamp_unix_ms,
+        );
+        assert!(queued.is_ok(), "first block should queue");
+
+        let finalized = daemon.run_maintenance_tick(timestamp_unix_ms.saturating_add(100));
+        assert!(
+            finalized.is_ok(),
+            "maintenance should finalize queued block"
+        );
+        assert_eq!(daemon.finalized_block().header.height, 1);
+
+        let replay = daemon.handle_inbound_gossip_message(
+            BLOCKS_TOPIC,
+            &payload,
+            "peer-replay",
+            timestamp_unix_ms.saturating_add(200),
+        );
+        assert!(
+            matches!(
+                replay,
+                Err(NodeDaemonError::BlockAdmission {
+                    source: InboundBlockAdmissionError::StaleHeight {
+                        block_height: 1,
+                        finalized_height: 1
+                    }
+                })
+            ),
+            "already finalized block replay must be rejected at inbound admission"
+        );
+        assert_eq!(daemon.pending_block_count(), 0);
+        assert_eq!(daemon.stats().inbound_block_consensus_rejected_total, 1);
+        assert_eq!(
+            daemon.peer_score("peer-replay", timestamp_unix_ms.saturating_add(201)),
+            -50
+        );
+    }
+
+    #[test]
+    fn inbound_block_rejects_parent_mismatch_at_finalized_boundary() {
+        let network = Network::Testnet;
+        let mut daemon = daemon_with_low_pow(network);
+        let slot = 0_u64;
+        let timestamp_unix_ms = timestamp_for_slot(slot, DEFAULT_SLOT_DURATION_MS);
+        let proposer = leader_for_slot(network, slot);
+        let mut block = empty_child_block(
+            network,
+            daemon.finalized_block(),
+            daemon.chain_state().state_root(),
+            timestamp_unix_ms,
+            proposer,
+        );
+        block.header.previous_block_hash = [9_u8; 32];
+        let block = sign_block_for_proposer(network, block);
+        let payload = block.encode();
+        assert!(payload.is_ok(), "block should encode");
+
+        let handled = daemon.handle_inbound_gossip_message(
+            BLOCKS_TOPIC,
+            &payload.unwrap_or_else(|_| unreachable!()),
+            "peer-parent-mismatch",
+            timestamp_unix_ms,
+        );
+        assert!(
+            matches!(
+                handled,
+                Err(NodeDaemonError::BlockAdmission {
+                    source: InboundBlockAdmissionError::ParentMismatch {
+                        block_height: 1,
+                        expected_parent_hash: _,
+                        observed_parent_hash
+                    }
+                }) if observed_parent_hash == [9_u8; 32]
+            ),
+            "next-height block with wrong parent must be rejected before queueing"
+        );
+        assert_eq!(daemon.pending_block_count(), 0);
+        assert_eq!(daemon.stats().inbound_block_consensus_rejected_total, 1);
+        assert_eq!(
+            daemon.peer_score("peer-parent-mismatch", timestamp_unix_ms.saturating_add(1)),
+            -50
+        );
+    }
+
+    #[test]
+    fn inbound_block_equivocation_same_slot_is_rejected() {
+        let network = Network::Testnet;
+        let mut daemon = daemon_with_low_pow(network);
+        let slot = 0_u64;
+        let proposer = leader_for_slot(network, slot);
+        let timestamp_one = timestamp_for_slot(slot, DEFAULT_SLOT_DURATION_MS);
+        let timestamp_two = timestamp_one.saturating_add(2);
+        let first_block = empty_child_block(
+            network,
+            daemon.finalized_block(),
+            daemon.chain_state().state_root(),
+            timestamp_one,
+            proposer.clone(),
+        );
+        let second_block = empty_child_block(
+            network,
+            daemon.finalized_block(),
+            daemon.chain_state().state_root(),
+            timestamp_two,
+            proposer,
+        );
+        let first_payload = first_block.encode();
+        let second_payload = second_block.encode();
+        assert!(first_payload.is_ok(), "first block should encode");
+        assert!(second_payload.is_ok(), "second block should encode");
+
+        let first = daemon.handle_inbound_gossip_message(
+            BLOCKS_TOPIC,
+            &first_payload.unwrap_or_else(|_| unreachable!()),
+            "peer-first",
+            timestamp_one,
+        );
+        assert!(first.is_ok(), "first block should be accepted");
+        assert_eq!(daemon.pending_block_count(), 1);
+
+        let second = daemon.handle_inbound_gossip_message(
+            BLOCKS_TOPIC,
+            &second_payload.unwrap_or_else(|_| unreachable!()),
+            "peer-equiv",
+            timestamp_two,
+        );
+        assert!(
+            matches!(
+                second,
+                Err(NodeDaemonError::BlockAdmission {
+                    source: InboundBlockAdmissionError::Equivocation { slot: 0, .. }
+                })
+            ),
+            "conflicting second block in same slot must be rejected as equivocation"
+        );
+        assert_eq!(daemon.pending_block_count(), 1);
+        assert_eq!(daemon.stats().blocks_queued_total, 1);
+        assert_eq!(daemon.stats().inbound_block_consensus_rejected_total, 1);
+        assert_eq!(daemon.peer_score("peer-equiv", timestamp_two + 1), -50);
+    }
+
+    #[test]
+    fn inbound_duplicate_block_is_ignored_without_queue_growth() {
+        let network = Network::Testnet;
+        let mut daemon = daemon_with_low_pow(network);
+        let slot = 0_u64;
+        let timestamp_unix_ms = timestamp_for_slot(slot, DEFAULT_SLOT_DURATION_MS);
+        let proposer = leader_for_slot(network, slot);
+        let block = empty_child_block(
+            network,
+            daemon.finalized_block(),
+            daemon.chain_state().state_root(),
+            timestamp_unix_ms,
+            proposer,
+        );
+        let payload = block.encode();
+        assert!(payload.is_ok(), "block should encode");
+        let payload = payload.unwrap_or_else(|_| unreachable!());
+
+        let first = daemon.handle_inbound_gossip_message(
+            BLOCKS_TOPIC,
+            &payload,
+            "peer-dup-first",
+            timestamp_unix_ms,
+        );
+        assert!(first.is_ok(), "first block should queue");
+        assert_eq!(daemon.pending_block_count(), 1);
+
+        let second = daemon.handle_inbound_gossip_message(
+            BLOCKS_TOPIC,
+            &payload,
+            "peer-dup-second",
+            timestamp_unix_ms.saturating_add(1),
+        );
+        assert!(
+            second.is_ok(),
+            "duplicate payload should be ignored, not rejected"
+        );
+        assert_eq!(daemon.pending_block_count(), 1);
+        assert_eq!(daemon.stats().blocks_queued_total, 1);
+        assert_eq!(daemon.stats().inbound_block_duplicate_total, 1);
+        assert_eq!(
+            daemon.peer_score("peer-dup-second", timestamp_unix_ms + 2),
+            0
+        );
+    }
+
+    #[test]
     fn maintenance_tick_finalizes_valid_pending_block() {
         let network = Network::Testnet;
         let mut daemon = daemon_with_low_pow(network);
+        let slot = 0_u64;
+        let timestamp_unix_ms = timestamp_for_slot(slot, DEFAULT_SLOT_DURATION_MS);
+        let proposer = leader_for_slot(network, slot);
 
         let block = empty_child_block(
+            network,
             daemon.finalized_block(),
             daemon.chain_state().state_root(),
-            daemon.finalized_block().header.proposer.clone(),
+            timestamp_unix_ms,
+            proposer,
         );
         let payload = block.encode();
         assert!(payload.is_ok(), "block should encode");
@@ -1653,14 +2506,14 @@ mod tests {
             BLOCKS_TOPIC,
             &payload.unwrap_or_else(|_| unreachable!()),
             "peer-block-good",
-            24_000,
+            timestamp_unix_ms,
         );
         assert!(
             matches!(handled, Ok(NodeInboundOutcome::BlockQueued { height: 1 })),
             "valid block payload should queue"
         );
 
-        let report = daemon.run_maintenance_tick(24_100);
+        let report = daemon.run_maintenance_tick(timestamp_unix_ms.saturating_add(100));
         assert!(report.is_ok(), "maintenance should run");
         let report = report.unwrap_or_else(|_| unreachable!());
         assert_eq!(report.finalized_blocks, 1);
@@ -1675,13 +2528,19 @@ mod tests {
     fn maintenance_tick_rejects_block_with_state_root_mismatch() {
         let network = Network::Testnet;
         let mut daemon = daemon_with_low_pow(network);
+        let slot = 0_u64;
+        let timestamp_unix_ms = timestamp_for_slot(slot, DEFAULT_SLOT_DURATION_MS);
+        let proposer = leader_for_slot(network, slot);
 
         let mut invalid_block = empty_child_block(
+            network,
             daemon.finalized_block(),
             daemon.chain_state().state_root(),
-            daemon.finalized_block().header.proposer.clone(),
+            timestamp_unix_ms,
+            proposer,
         );
         invalid_block.header.state_root = [7_u8; 32];
+        let invalid_block = sign_block_for_proposer(network, invalid_block);
         let payload = invalid_block.encode();
         assert!(payload.is_ok(), "invalid block payload should encode");
 
@@ -1689,11 +2548,11 @@ mod tests {
             BLOCKS_TOPIC,
             &payload.unwrap_or_else(|_| unreachable!()),
             "peer-block-bad-root",
-            25_000,
+            timestamp_unix_ms,
         );
         assert!(queued.is_ok(), "invalid-root block should still queue");
 
-        let report = daemon.run_maintenance_tick(25_100);
+        let report = daemon.run_maintenance_tick(timestamp_unix_ms.saturating_add(100));
         assert!(report.is_ok(), "maintenance should run");
         let report = report.unwrap_or_else(|_| unreachable!());
         assert_eq!(report.finalized_blocks, 0);
@@ -1708,15 +2567,25 @@ mod tests {
     fn maintenance_tick_keeps_future_block_until_parent_arrives() {
         let network = Network::Testnet;
         let mut daemon = daemon_with_low_pow(network);
+        let slot_one = 0_u64;
+        let slot_two = 1_u64;
+        let timestamp_one = timestamp_for_slot(slot_one, DEFAULT_SLOT_DURATION_MS);
+        let timestamp_two = timestamp_for_slot(slot_two, DEFAULT_SLOT_DURATION_MS);
+        let proposer_one = leader_for_slot(network, slot_one);
+        let proposer_two = leader_for_slot(network, slot_two);
         let block_one = empty_child_block(
+            network,
             daemon.finalized_block(),
             daemon.chain_state().state_root(),
-            daemon.finalized_block().header.proposer.clone(),
+            timestamp_one,
+            proposer_one,
         );
         let block_two = empty_child_block(
+            network,
             &block_one,
             daemon.chain_state().state_root(),
-            daemon.finalized_block().header.proposer.clone(),
+            timestamp_two,
+            proposer_two,
         );
 
         let block_two_payload = block_two.encode();
@@ -1725,11 +2594,11 @@ mod tests {
             BLOCKS_TOPIC,
             &block_two_payload.unwrap_or_else(|_| unreachable!()),
             "peer-future",
-            26_000,
+            timestamp_two,
         );
         assert!(queued_block_two.is_ok(), "future block should queue");
 
-        let first_report = daemon.run_maintenance_tick(26_100);
+        let first_report = daemon.run_maintenance_tick(timestamp_two.saturating_add(100));
         assert!(first_report.is_ok(), "maintenance should run");
         let first_report = first_report.unwrap_or_else(|_| unreachable!());
         assert_eq!(first_report.finalized_blocks, 0);
@@ -1743,11 +2612,11 @@ mod tests {
             BLOCKS_TOPIC,
             &block_one_payload.unwrap_or_else(|_| unreachable!()),
             "peer-parent",
-            26_200,
+            timestamp_two.saturating_add(200),
         );
         assert!(queued_block_one.is_ok(), "parent block should queue");
 
-        let second_report = daemon.run_maintenance_tick(26_300);
+        let second_report = daemon.run_maintenance_tick(timestamp_two.saturating_add(300));
         assert!(second_report.is_ok(), "maintenance should run");
         let second_report = second_report.unwrap_or_else(|_| unreachable!());
         assert_eq!(second_report.finalized_blocks, 2);
@@ -1761,6 +2630,9 @@ mod tests {
     fn finalizing_block_evicts_included_transactions_from_mempool() {
         let network = Network::Testnet;
         let mut daemon = daemon_with_low_pow(network);
+        let slot = 0_u64;
+        let timestamp_unix_ms = timestamp_for_slot(slot, DEFAULT_SLOT_DURATION_MS);
+        let proposer = leader_for_slot(network, slot);
 
         let transaction = signed_transaction_from_genesis_sender(network, 1, 100, 2);
         let tx_payload = transaction.encode();
@@ -1781,12 +2653,8 @@ mod tests {
                 .hash()
                 .unwrap_or_else(|_| unreachable!()),
             [0_u8; 32],
-            daemon
-                .finalized_block()
-                .header
-                .timestamp_unix_ms
-                .saturating_add(1),
-            daemon.finalized_block().header.proposer.clone(),
+            timestamp_unix_ms,
+            proposer,
         );
         let block = Block::new_unsigned(header, vec![transaction]);
         assert!(block.is_ok(), "block should build");
@@ -1795,6 +2663,7 @@ mod tests {
         let applied = post_state.apply_block(&block);
         assert!(applied.is_ok(), "block transition should apply");
         block.header.state_root = post_state.state_root();
+        let block = sign_block_for_proposer(network, block);
 
         let block_payload = block.encode();
         assert!(block_payload.is_ok(), "block should encode");
@@ -1802,11 +2671,11 @@ mod tests {
             BLOCKS_TOPIC,
             &block_payload.unwrap_or_else(|_| unreachable!()),
             "peer-block-evict",
-            27_100,
+            timestamp_unix_ms,
         );
         assert!(block_queued.is_ok(), "block should queue");
 
-        let report = daemon.run_maintenance_tick(27_200);
+        let report = daemon.run_maintenance_tick(timestamp_unix_ms.saturating_add(100));
         assert!(report.is_ok(), "maintenance should run");
         let report = report.unwrap_or_else(|_| unreachable!());
         assert_eq!(report.finalized_blocks, 1);
@@ -1828,6 +2697,8 @@ mod tests {
         assert_eq!(report.produced_blocks, 1);
         assert_eq!(report.finalized_blocks, 1);
         assert_eq!(daemon.finalized_block().header.height, 1);
+        assert_eq!(daemon.finalized_block().proposer_signature.len(), 64);
+        assert_eq!(daemon.finalized_block().proposer_public_key.len(), 32);
         assert_eq!(daemon.stats().blocks_produced_total, 1);
     }
 
@@ -1958,15 +2829,7 @@ mod tests {
     #[test]
     fn persist_runtime_state_flushes_state_and_sync_checkpoint() {
         let daemon = daemon_with_low_pow(Network::Testnet);
-        let mut directory = std::env::temp_dir();
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0_u128, |duration| duration.as_nanos());
-        directory.push(format!(
-            "homa-daemon-persist-{}-{unique}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&directory);
+        let directory = test_directory("homa-daemon-persist");
 
         let persisted = daemon.persist_runtime_state(&directory);
         assert!(
@@ -1982,14 +2845,214 @@ mod tests {
             persisted.sync_checkpoint_bytes > 0,
             "sync checkpoint persistence should report encoded bytes"
         );
+        assert!(
+            persisted.finalized_block_checkpoint_bytes > 0,
+            "finalized-block checkpoint persistence should report encoded bytes"
+        );
 
         let snapshot_path = directory.join(SNAPSHOT_FILE_NAME);
         let sync_path = directory.join(SYNC_SESSION_CHECKPOINT_FILE_NAME);
+        let finalized_path = directory.join(FINALIZED_BLOCK_CHECKPOINT_FILE_NAME);
         assert!(
             snapshot_path.exists(),
             "state snapshot file should be written"
         );
         assert!(sync_path.exists(), "sync checkpoint file should be written");
+        assert!(
+            finalized_path.exists(),
+            "finalized-block checkpoint file should be written"
+        );
+
+        let cleanup = fs::remove_dir_all(&directory);
+        assert!(
+            cleanup.is_ok(),
+            "test persistence directory should clean up"
+        );
+    }
+
+    #[test]
+    fn from_persisted_or_genesis_restores_finalized_state_after_restart() {
+        let network = Network::Testnet;
+        let mut daemon = daemon_with_low_pow(network);
+        let slot = 0_u64;
+        let timestamp_unix_ms = timestamp_for_slot(slot, DEFAULT_SLOT_DURATION_MS);
+        let proposer = leader_for_slot(network, slot);
+        let block = empty_child_block(
+            network,
+            daemon.finalized_block(),
+            daemon.chain_state().state_root(),
+            timestamp_unix_ms,
+            proposer,
+        );
+        let payload = block.encode();
+        assert!(payload.is_ok(), "block should encode");
+        let queued = daemon.handle_inbound_gossip_message(
+            BLOCKS_TOPIC,
+            &payload.unwrap_or_else(|_| unreachable!()),
+            "peer-restart",
+            timestamp_unix_ms,
+        );
+        assert!(
+            matches!(queued, Ok(NodeInboundOutcome::BlockQueued { height: 1 })),
+            "inbound block should queue before restart persistence"
+        );
+        let finalized = daemon.run_maintenance_tick(timestamp_unix_ms.saturating_add(100));
+        assert!(
+            finalized.is_ok(),
+            "maintenance should finalize queued block"
+        );
+        assert_eq!(daemon.finalized_block().header.height, 1);
+
+        let expected_hash = daemon.finalized_block().hash();
+        assert!(expected_hash.is_ok(), "finalized block hash should compute");
+        let expected_hash = expected_hash.unwrap_or_else(|_| unreachable!());
+        let expected_height = daemon.finalized_block().header.height;
+        let expected_state_root = daemon.chain_state().state_root();
+        let directory = test_directory("homa-daemon-restart");
+        let persisted = daemon.persist_runtime_state(&directory);
+        assert!(persisted.is_ok(), "persist should succeed");
+
+        let mut config = NodeDaemonConfig::for_network(network);
+        config.mempool_config = MempoolConfig::new(10_000, 0, network);
+        config.max_pending_blocks = 16;
+        let recovered = NodeDaemon::from_persisted_or_genesis(config, &directory);
+        assert!(
+            recovered.is_ok(),
+            "daemon should recover from persisted state"
+        );
+        let recovered = recovered.unwrap_or_else(|_| unreachable!());
+        assert_eq!(recovered.finalized_block().header.height, expected_height);
+        assert_eq!(recovered.chain_state().state_root(), expected_state_root);
+        let recovered_hash = recovered.finalized_block().hash();
+        assert!(
+            recovered_hash.is_ok(),
+            "recovered finalized block hash should compute"
+        );
+        assert_eq!(
+            recovered_hash.unwrap_or_else(|_| unreachable!()),
+            expected_hash
+        );
+
+        let cleanup = fs::remove_dir_all(&directory);
+        assert!(
+            cleanup.is_ok(),
+            "test persistence directory should clean up"
+        );
+    }
+
+    #[test]
+    fn from_persisted_or_genesis_bootstraps_genesis_when_state_absent() {
+        let network = Network::Testnet;
+        let directory = test_directory("homa-daemon-empty");
+        let mut config = NodeDaemonConfig::for_network(network);
+        config.mempool_config = MempoolConfig::new(10_000, 0, network);
+        config.max_pending_blocks = 16;
+
+        let daemon = NodeDaemon::from_persisted_or_genesis(config, &directory);
+        assert!(
+            daemon.is_ok(),
+            "daemon should fall back to genesis when no persisted state exists"
+        );
+        let daemon = daemon.unwrap_or_else(|_| unreachable!());
+        assert_eq!(daemon.finalized_block().header.height, 0);
+        assert_eq!(daemon.pending_block_count(), 0);
+
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn from_persisted_or_genesis_rejects_missing_finalized_block_checkpoint() {
+        let network = Network::Testnet;
+        let daemon = daemon_with_low_pow(network);
+        let directory = test_directory("homa-daemon-missing-finalized");
+        let persisted = daemon.persist_runtime_state(&directory);
+        assert!(persisted.is_ok(), "persist should succeed");
+
+        let remove = fs::remove_file(directory.join(FINALIZED_BLOCK_CHECKPOINT_FILE_NAME));
+        assert!(
+            remove.is_ok(),
+            "finalized-block checkpoint should be removable for corruption test"
+        );
+
+        let mut config = NodeDaemonConfig::for_network(network);
+        config.mempool_config = MempoolConfig::new(10_000, 0, network);
+        config.max_pending_blocks = 16;
+        let restored = NodeDaemon::from_persisted_or_genesis(config, &directory);
+        assert!(
+            matches!(
+                restored,
+                Err(NodeDaemonError::MissingFinalizedBlockCheckpoint { path: _ })
+            ),
+            "daemon startup must reject persisted state missing finalized-block checkpoint"
+        );
+
+        let cleanup = fs::remove_dir_all(&directory);
+        assert!(
+            cleanup.is_ok(),
+            "test persistence directory should clean up"
+        );
+    }
+
+    #[test]
+    fn from_persisted_or_genesis_sanitizes_in_flight_sync_checkpoint_state() {
+        let network = Network::Testnet;
+        let mut daemon = daemon_with_low_pow(network);
+        let scheduled = daemon.sync_runtime_mut().schedule_outbound_request(
+            "peer-sync",
+            7,
+            SnapshotChunkRequest {
+                request_id: 42,
+                block_height: 1,
+                state_root: [3_u8; 32],
+                snapshot_hash: [4_u8; 32],
+                chunk_index: 0,
+                total_chunks: 1,
+            },
+            9_000,
+        );
+        assert!(scheduled.is_ok(), "sync request should schedule");
+        let directory = test_directory("homa-daemon-sync-in-flight");
+        let persisted = daemon.persist_runtime_state(&directory);
+        assert!(persisted.is_ok(), "persist should succeed");
+
+        let mut config = NodeDaemonConfig::for_network(network);
+        config.mempool_config = MempoolConfig::new(10_000, 0, network);
+        config.max_pending_blocks = 16;
+        let restored = NodeDaemon::from_persisted_or_genesis(config, &directory);
+        assert!(
+            restored.is_ok(),
+            "startup recovery should sanitize stranded in-flight sync transport state"
+        );
+        let mut restored = restored.unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            restored.sync_runtime_mut().in_flight_request_count(),
+            0,
+            "recovered scheduler must not retain in-flight request transport state"
+        );
+        assert_eq!(
+            restored
+                .sync_runtime_mut()
+                .peer_in_flight_count("peer-sync"),
+            0,
+            "recovered session manager must not retain in-flight peer chunk state"
+        );
+        let rescheduled = restored.sync_runtime_mut().schedule_outbound_request(
+            "peer-sync",
+            7,
+            SnapshotChunkRequest {
+                request_id: 77,
+                block_height: 1,
+                state_root: [3_u8; 32],
+                snapshot_hash: [4_u8; 32],
+                chunk_index: 0,
+                total_chunks: 1,
+            },
+            9_500,
+        );
+        assert!(
+            rescheduled.is_ok(),
+            "sync scheduling should remain operational after restart sanitization"
+        );
 
         let cleanup = fs::remove_dir_all(&directory);
         assert!(

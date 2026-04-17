@@ -398,6 +398,29 @@ impl SyncRuntimeCoordinator {
         })
     }
 
+    /// Builds a runtime coordinator from recovered scheduler/session runtime state.
+    pub fn with_recovered_transport_state(
+        scheduler: ChunkRequestScheduler,
+        session_manager: ChunkSessionManager,
+        max_chunk_bytes: usize,
+        admission_policy: SnapshotAdmissionPolicy,
+        import_failure_policy: SnapshotImportFailurePolicy,
+    ) -> Result<Self, SyncRuntimeError> {
+        validate_assembly_policy(max_chunk_bytes, admission_policy)?;
+        validate_import_failure_policy(import_failure_policy)?;
+        Ok(Self {
+            scheduler,
+            session_manager,
+            request_sessions: HashMap::new(),
+            max_chunk_bytes,
+            admission_policy,
+            import_failure_policy,
+            assemblers: HashMap::new(),
+            completed_snapshots: VecDeque::new(),
+            quarantined_snapshots: VecDeque::new(),
+        })
+    }
+
     /// Schedules one outbound chunk request under session backoff + in-flight limits.
     pub fn schedule_outbound_request(
         &mut self,

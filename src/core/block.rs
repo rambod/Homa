@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::core::transaction::{Transaction, TransactionError};
-use crate::crypto::keys::SIGNATURE_LENGTH;
+use crate::crypto::address::{AddressError, Network, derive_address};
+use crate::crypto::keys::{CryptoError, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH, verify_signature};
 
 /// Hash length used by BLAKE3 in bytes.
 pub const HASH_LENGTH: usize = 32;
@@ -49,6 +50,9 @@ pub struct Block {
     /// Proposer signature over canonical header bytes.
     #[serde(with = "serde_bytes")]
     pub proposer_signature: Vec<u8>,
+    /// Proposer public key used for signature verification and address binding.
+    #[serde(with = "serde_bytes")]
+    pub proposer_public_key: Vec<u8>,
 }
 
 /// Block validation and codec errors.
@@ -63,6 +67,35 @@ pub enum BlockError {
     /// Proposer signature size is not 64 bytes.
     #[error("invalid proposer signature length: expected {expected}, got {actual}")]
     InvalidSignatureLength { expected: usize, actual: usize },
+    /// Proposer public key size is not 32 bytes.
+    #[error("invalid proposer public key length: expected {expected}, got {actual}")]
+    InvalidPublicKeyLength { expected: usize, actual: usize },
+    /// Proposer signature is missing.
+    #[error("block proposer signature is missing")]
+    MissingProposerSignature,
+    /// Proposer public key is missing.
+    #[error("block proposer public key is missing")]
+    MissingProposerPublicKey,
+    /// Proposer address derivation from public key failed.
+    #[error("block proposer address derivation failed")]
+    ProposerAddressDerivation {
+        /// Underlying address derivation error.
+        source: AddressError,
+    },
+    /// Derived proposer address does not match header proposer.
+    #[error("block proposer address mismatch: expected {expected}, got {actual}")]
+    ProposerAddressMismatch {
+        /// Address derived from proposer public key.
+        expected: String,
+        /// Address encoded in block header.
+        actual: String,
+    },
+    /// Proposer signature verification failed.
+    #[error("block proposer signature verification failed")]
+    ProposerSignatureVerification {
+        /// Underlying crypto verification error.
+        source: CryptoError,
+    },
     /// Header transaction root does not match block transactions.
     #[error("transactions root mismatch")]
     TransactionsRootMismatch,
@@ -115,6 +148,7 @@ impl Block {
             header,
             transactions,
             proposer_signature: Vec::new(),
+            proposer_public_key: Vec::new(),
         })
     }
 
@@ -123,6 +157,24 @@ impl Block {
     pub fn with_proposer_signature(mut self, signature: [u8; SIGNATURE_LENGTH]) -> Self {
         self.proposer_signature = signature.to_vec();
         self
+    }
+
+    /// Assigns the proposer public key bytes.
+    #[must_use]
+    pub fn with_proposer_public_key(mut self, public_key: [u8; PUBLIC_KEY_LENGTH]) -> Self {
+        self.proposer_public_key = public_key.to_vec();
+        self
+    }
+
+    /// Assigns proposer signature and matching public key proof.
+    #[must_use]
+    pub fn with_proposer_proof(
+        self,
+        signature: [u8; SIGNATURE_LENGTH],
+        public_key: [u8; PUBLIC_KEY_LENGTH],
+    ) -> Self {
+        self.with_proposer_signature(signature)
+            .with_proposer_public_key(public_key)
     }
 
     /// Encodes canonical header bytes used for proposer signatures and block hash.
@@ -184,6 +236,14 @@ impl Block {
                 actual: self.proposer_signature.len(),
             });
         }
+        if !self.proposer_public_key.is_empty()
+            && self.proposer_public_key.len() != PUBLIC_KEY_LENGTH
+        {
+            return Err(BlockError::InvalidPublicKeyLength {
+                expected: PUBLIC_KEY_LENGTH,
+                actual: self.proposer_public_key.len(),
+            });
+        }
 
         let expected_transactions_root = compute_transactions_root(&self.transactions)?;
         if self.header.transactions_root != expected_transactions_root {
@@ -199,6 +259,38 @@ impl Block {
                     .map_err(|source| BlockError::InvalidTransaction { index, source })
             })?;
 
+        Ok(())
+    }
+
+    /// Validates proposer signature+address binding for one network domain.
+    pub fn validate_proposer_proof_for_network(&self, network: Network) -> Result<(), BlockError> {
+        self.validate_basic()?;
+        if self.header.height == 0 {
+            return Ok(());
+        }
+        if self.proposer_signature.is_empty() {
+            return Err(BlockError::MissingProposerSignature);
+        }
+        if self.proposer_public_key.is_empty() {
+            return Err(BlockError::MissingProposerPublicKey);
+        }
+
+        let derived_address = derive_address(&self.proposer_public_key, network)
+            .map_err(|source| BlockError::ProposerAddressDerivation { source })?;
+        if derived_address != self.header.proposer {
+            return Err(BlockError::ProposerAddressMismatch {
+                expected: derived_address,
+                actual: self.header.proposer.clone(),
+            });
+        }
+
+        let signing_bytes = self.header_signing_bytes()?;
+        verify_signature(
+            &self.proposer_public_key,
+            &signing_bytes,
+            &self.proposer_signature,
+        )
+        .map_err(|source| BlockError::ProposerSignatureVerification { source })?;
         Ok(())
     }
 }
@@ -220,6 +312,8 @@ fn compute_transactions_root(transactions: &[Transaction]) -> Result<Transaction
 mod tests {
     use super::{BLOCK_VERSION, Block, BlockError, BlockHeader, HASH_LENGTH};
     use crate::core::transaction::Transaction;
+    use crate::crypto::address::{Network, derive_address};
+    use crate::crypto::keys::Keypair;
 
     fn sample_transactions() -> Vec<Transaction> {
         vec![
@@ -236,6 +330,22 @@ mod tests {
             1_717_171_717_u64,
             "HMA_VALIDATOR".to_owned(),
         )
+    }
+
+    fn sample_signed_header(network: Network, height: u64) -> (Keypair, BlockHeader) {
+        let keypair = Keypair::from_secret_key(&[9_u8; 32]);
+        assert!(keypair.is_ok(), "seeded keypair should parse");
+        let keypair = keypair.unwrap_or_else(|_| unreachable!());
+        let proposer = derive_address(&keypair.public_key_bytes(), network);
+        assert!(proposer.is_ok(), "proposer address should derive");
+        let header = BlockHeader::new(
+            height,
+            [5_u8; HASH_LENGTH],
+            [7_u8; HASH_LENGTH],
+            1_717_171_717_u64,
+            proposer.unwrap_or_else(|_| unreachable!()),
+        );
+        (keypair, header)
     }
 
     #[test]
@@ -342,6 +452,94 @@ mod tests {
             block,
             decoded.unwrap_or_else(|_| unreachable!()),
             "block should roundtrip through binary codec"
+        );
+    }
+
+    #[test]
+    fn proposer_proof_validation_accepts_matching_signature_and_address() {
+        let (keypair, header) = sample_signed_header(Network::Testnet, 1);
+        let block_result = Block::new_unsigned(header, sample_transactions());
+        assert!(block_result.is_ok(), "block should construct");
+        let block = block_result.unwrap_or_else(|_| unreachable!());
+        let signing_bytes = block.header_signing_bytes();
+        assert!(signing_bytes.is_ok(), "header signing bytes should build");
+        let block = block.with_proposer_proof(
+            keypair.sign(&signing_bytes.unwrap_or_else(|_| unreachable!())),
+            keypair.public_key_bytes(),
+        );
+
+        let validated = block.validate_proposer_proof_for_network(Network::Testnet);
+        assert!(validated.is_ok(), "valid proposer proof should verify");
+    }
+
+    #[test]
+    fn proposer_proof_validation_rejects_mismatched_proposer_address() {
+        let (keypair, mut header) = sample_signed_header(Network::Testnet, 1);
+        let attacker = Keypair::from_secret_key(&[8_u8; 32]);
+        assert!(attacker.is_ok(), "attacker key should parse");
+        let attacker = attacker.unwrap_or_else(|_| unreachable!());
+        let attacker_address = derive_address(&attacker.public_key_bytes(), Network::Testnet);
+        assert!(attacker_address.is_ok(), "attacker address should derive");
+        header.proposer = attacker_address.unwrap_or_else(|_| unreachable!());
+
+        let block_result = Block::new_unsigned(header, sample_transactions());
+        assert!(block_result.is_ok(), "block should construct");
+        let block = block_result.unwrap_or_else(|_| unreachable!());
+        let signing_bytes = block.header_signing_bytes();
+        assert!(signing_bytes.is_ok(), "header signing bytes should build");
+        let block = block.with_proposer_proof(
+            keypair.sign(&signing_bytes.unwrap_or_else(|_| unreachable!())),
+            keypair.public_key_bytes(),
+        );
+
+        assert!(
+            matches!(
+                block.validate_proposer_proof_for_network(Network::Testnet),
+                Err(BlockError::ProposerAddressMismatch {
+                    expected: _,
+                    actual: _
+                })
+            ),
+            "header proposer must match address derived from proposer public key"
+        );
+    }
+
+    #[test]
+    fn proposer_proof_validation_rejects_signature_tampering() {
+        let (keypair, header) = sample_signed_header(Network::Testnet, 1);
+        let block_result = Block::new_unsigned(header, sample_transactions());
+        assert!(block_result.is_ok(), "block should construct");
+        let block = block_result.unwrap_or_else(|_| unreachable!());
+        let signing_bytes = block.header_signing_bytes();
+        assert!(signing_bytes.is_ok(), "header signing bytes should build");
+        let mut block = block.with_proposer_proof(
+            keypair.sign(&signing_bytes.unwrap_or_else(|_| unreachable!())),
+            keypair.public_key_bytes(),
+        );
+        block.proposer_signature[0] ^= 0x01;
+
+        assert!(
+            matches!(
+                block.validate_proposer_proof_for_network(Network::Testnet),
+                Err(BlockError::ProposerSignatureVerification { source: _ })
+            ),
+            "tampered proposer signature must fail verification"
+        );
+    }
+
+    #[test]
+    fn proposer_proof_validation_rejects_missing_signature_for_non_genesis() {
+        let (_keypair, header) = sample_signed_header(Network::Testnet, 2);
+        let block_result = Block::new_unsigned(header, sample_transactions());
+        assert!(block_result.is_ok(), "block should construct");
+        let block = block_result.unwrap_or_else(|_| unreachable!());
+
+        assert!(
+            matches!(
+                block.validate_proposer_proof_for_network(Network::Testnet),
+                Err(BlockError::MissingProposerSignature)
+            ),
+            "non-genesis blocks require proposer signatures"
         );
     }
 
