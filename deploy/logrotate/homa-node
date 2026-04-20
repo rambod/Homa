@@ -1,0 +1,9 @@
+/var/log/homa/node.log /var/log/homa/node.err.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

@@ -6,8 +6,12 @@ pub mod block;
 pub mod fork_choice;
 /// Genesis block and initial allocations.
 pub mod genesis;
+/// Durable finalized-block event indexer and replayable query indexes.
+pub mod indexer;
 /// Mempool data structures and ingestion checks.
 pub mod mempool;
+/// Durable mempool checkpoint persistence/recovery primitives.
+pub mod mempool_checkpoint;
 /// Crash-safe state commit and recovery primitives.
 pub mod recovery;
 /// Account state storage and block application.

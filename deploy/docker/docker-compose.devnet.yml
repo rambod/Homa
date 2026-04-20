@@ -1,0 +1,42 @@
+version: "3.9"
+services:
+  homa-node-1:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    container_name: homa-node-1
+    volumes:
+      - ../../node.toml.example:/etc/homa/node.toml:ro
+      - homa-state-1:/var/lib/homa
+    ports:
+      - "8545:8545"
+      - "7000:7000"
+      - "7001:7001/udp"
+  homa-node-2:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    container_name: homa-node-2
+    volumes:
+      - ../../node.toml.example:/etc/homa/node.toml:ro
+      - homa-state-2:/var/lib/homa
+    ports:
+      - "8546:8545"
+      - "7010:7000"
+      - "7011:7001/udp"
+  homa-node-3:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    container_name: homa-node-3
+    volumes:
+      - ../../node.toml.example:/etc/homa/node.toml:ro
+      - homa-state-3:/var/lib/homa
+    ports:
+      - "8547:8545"
+      - "7020:7000"
+      - "7021:7001/udp"
+volumes:
+  homa-state-1:
+  homa-state-2:
+  homa-state-3:

@@ -1,0 +1,20 @@
+[Unit]
+Description=Homa Node Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=homa
+Group=homa
+WorkingDirectory=/opt/homa
+ExecStart=/opt/homa/homa-node run --config /etc/homa/node.toml
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+Environment=RUST_LOG=info
+StandardOutput=append:/var/log/homa/node.log
+StandardError=append:/var/log/homa/node.err.log
+
+[Install]
+WantedBy=multi-user.target

@@ -501,3 +501,98 @@ Eliminate restart fragility caused by persisted in-flight sync transport state t
 - [x] **Expansion:** Updated `src/network/sync_engine.rs` with `abandon_in_flight_for_restart(...)` APIs on `ChunkRequestScheduler` and `ChunkSessionManager` plus targeted tests.
 - [x] **Expansion:** Updated `src/node/daemon.rs` recovered-sync path to sanitize recovered in-flight transport state and continue deterministic startup recovery.
 - [x] **Expansion:** Replaced the previous startup-rejection regression with restart-sanitization coverage in daemon tests.
+
+---
+
+## 31. Phase 30: Durable Mempool Persistence (Expansion V24)
+
+Add durable mempool checkpoint storage/recovery with strict restart revalidation and explicit operator-facing recovery accounting.
+
+### Task List
+- [x] **`redb`-Backed Mempool Checkpoint:** Added durable mempool checkpoint storage/recovery in `src/core/mempool_checkpoint.rs` using versioned metadata + network-domain checks (`mempool.checkpoint.redb`).
+- [x] **Graceful + Periodic Flush Path:** Wired mempool checkpoint persistence into daemon shutdown flush (`persist_runtime_state`) and periodic maintenance ticks (`mempool_checkpoint_interval_ms`) when persistence is configured.
+- [x] **Restart Revalidation + Pruning:** Added restart ingest path that revalidates recovered entries against recovered chain state and mempool uniqueness constraints, dropping invalid/stale/conflicting entries deterministically.
+- [x] **Typed Recovery Counters:** Extended daemon recovery reporting with `mempool_recovered`, `mempool_dropped_invalid`, and `mempool_dropped_conflict`.
+- [x] **Runtime Config + CLI Surface:** Added `mempool_checkpoint_interval_ms` to `node.toml`, CLI flags, config validation, and operator report output.
+- [x] **Expansion:** Added `Mempool::checkpoint_entries(...)`, `Mempool::insert_recovered_checkpoint_entry(...)`, and focused checkpoint + daemon recovery/periodic persistence tests.
+- [x] **Acceptance Gate:** Passed `cargo fmt --all`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace --all-targets`, and `bash scripts/release_gate.sh`.
+
+---
+
+## 32. Phase 31: Persistent Indexer Pipeline (Expansion V25)
+
+Add durable finalized-block event indexing with replayable recovery and bounded retention compaction.
+
+### Task List
+- [x] **Finalization-Boundary Event Log:** Added append-only finalized block event storage in `src/core/indexer.rs` (`redb`) and wired append calls at daemon finalization boundary.
+- [x] **Persistent Query Indexes:** Implemented durable indexes:
+  - `tx_by_hash`
+  - `tx_by_sender_nonce`
+  - `tx_by_address_timeline`
+  - `block_by_height`
+- [x] **Deterministic Replay/Rebuild:** Added startup/indexer rebuild routine that replays retained finalized events when secondary indexes are missing/out-of-sync/corrupt.
+- [x] **Retention + Compaction Policy:** Added bounded retention policy (`index_max_retained_blocks`) with segment compaction that prunes old finalized events and corresponding secondary-index rows.
+- [x] **Daemon + Config Wiring:** Integrated indexer attachment in daemon persistence configuration, added index diagnostics in persistence report, and exposed daemon query helpers for indexed block/transaction/timeline lookups.
+- [x] **CLI/Config Surface:** Added `index_max_retained_blocks` to node config parsing/validation, CLI overrides, and `node.toml.example`.
+- [x] **Expansion:** Added focused indexer unit coverage (roundtrip queries, rebuild flow, compaction pruning, idempotent ensure) plus daemon integration test proving finalized tx indexing path under persistent runtime.
+
+---
+
+## 33. Phase 32: Production Node Lifecycle Completion (Expansion V26)
+
+Complete daemon lifecycle management with explicit startup/shutdown states, strict integrity checks, and operator-controlled recovery modes.
+
+### Task List
+- [x] **Explicit Lifecycle State Machine:** Added/operationalized `NodeLifecycleState::{Bootstrapping, Syncing, Ready, Draining, Stopped}` in daemon runtime transitions.
+- [x] **Resilient Drain/Stop Semantics:** Added `drain_and_stop()` shutdown path that transitions to `Draining`, flushes checkpoints, drops index/swarm handles, and finalizes `Stopped`.
+- [x] **Intake Stop Gate:** Enforced inbound intake rejection outside `Ready|Syncing` with typed `NodeDaemonError::IntakeStopped`.
+- [x] **Startup Integrity Coherence Checks:** Added startup validation for recovered sync policy coherence, mempool-vs-state coherence, and finalized-index tip coherence with strict fail-closed behavior.
+- [x] **Operator Recovery Modes:** Added config/runtime controls:
+  - `strict_recovery`
+  - `repair_index`
+  - `ignore_mempool_checkpoint`
+- [x] **Runtime Config + CLI + Example Wiring:** Extended `NodeRuntimeConfig`, `NodeRuntimeOverrides`, CLI args, and `node.toml.example` with all lifecycle/recovery-mode controls.
+- [x] **Recovery/Shutdown Regression Coverage:** Added daemon tests for strict vs non-strict sync mismatch recovery, ignore-mempool checkpoint mode, explicit index repair mode, lifecycle transition to stopped, and post-stop intake rejection.
+- [x] **Acceptance Gate:** Passed:
+  - `cargo fmt --all`
+  - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  - `cargo test --workspace --all-targets`
+  - `bash scripts/release_gate.sh`
+
+---
+
+## 34. Phase 33: JSON-RPC + WS Node API (Expansion V27)
+
+Add a production-oriented API surface for node query/submission and operator observability over JSON-RPC and WebSocket subscriptions.
+
+### Task List
+- [x] **RPC Server Module:** Added `src/node/rpc.rs` with runtime server bootstrapping (`axum`) and daemon-state integration.
+- [x] **Daemon Runtime Wiring:** Wired RPC startup into `homa-node run` lifecycle using shared daemon state, graceful shutdown coordination, and stop/drain persistence semantics.
+- [x] **Config/CLI Surface:** Added runtime/CLI options:
+  - `rpc_listen_addr`
+  - `rpc_max_body_bytes`
+  - `rpc_rate_limit_per_sec`
+  - `ws_max_subscriptions_per_conn`
+- [x] **Core JSON-RPC Methods Implemented:**
+  - `homa_getStatus`
+  - `homa_getBlockByHeight`
+  - `homa_getBlockByHash`
+  - `homa_getBalance`
+  - `homa_getTransaction`
+  - `homa_sendRawTransaction`
+  - `homa_getMempoolStats`
+  - `homa_getPeers`
+- [x] **WS Subscription Channels Implemented:**
+  - `newHeads`
+  - `txAccepted`
+  - `syncStatus`
+  - `peerReputationEvents`
+- [x] **Request Hardening:** Enforced bounded request sizes (`DefaultBodyLimit` / WS message cap) and per-IP fixed-window rate limiting.
+- [x] **Typed RPC Error Mapping:** Added JSON-RPC typed error object mapping for daemon/runtime failures and invalid request/params paths.
+- [x] **Indexer Query Expansion:** Added `FinalizedIndexer::get_block_by_hash(...)` and daemon query wrappers for hash-based block resolution.
+- [x] **Regression Coverage:** Added RPC unit tests for status query, raw transaction submit+pending lookup roundtrip, and rate limiter behavior.
+- [x] **Acceptance Gate:** Passed:
+  - `cargo fmt --all`
+  - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  - `cargo test --workspace --all-targets`
+  - `bash scripts/release_gate.sh`

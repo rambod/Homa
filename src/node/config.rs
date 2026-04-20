@@ -1,6 +1,7 @@
 //! Node runtime configuration loading and validation.
 
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -13,6 +14,12 @@ const DEFAULT_SEED_DOMAIN: &str = "seed1.homanetwork.io";
 const MAX_POW_BITS: u16 = 256;
 const DEFAULT_SLOT_DURATION_MS: u64 = 1_000;
 const DEFAULT_MAX_BLOCK_TRANSACTIONS: usize = 1_024;
+const DEFAULT_MEMPOOL_CHECKPOINT_INTERVAL_MS: u64 = 10_000;
+const DEFAULT_INDEX_MAX_RETAINED_BLOCKS: usize = 100_000;
+const DEFAULT_RPC_LISTEN_ADDR: &str = "127.0.0.1:8545";
+const DEFAULT_RPC_MAX_BODY_BYTES: usize = 256 * 1024;
+const DEFAULT_RPC_RATE_LIMIT_PER_SEC: u32 = 100;
+const DEFAULT_WS_MAX_SUBSCRIPTIONS_PER_CONN: usize = 32;
 
 /// Typed network selector for node configuration files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -40,6 +47,7 @@ impl NodeConfigNetwork {
 }
 
 /// Runtime configuration used by the node daemon CLI.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NodeRuntimeConfig {
@@ -65,6 +73,24 @@ pub struct NodeRuntimeConfig {
     pub max_block_transactions: usize,
     /// Maximum pending decoded block queue size.
     pub max_pending_blocks: usize,
+    /// Interval for periodic mempool checkpoint flushes in milliseconds.
+    pub mempool_checkpoint_interval_ms: u64,
+    /// Maximum retained finalized blocks in persistent query indexes.
+    pub index_max_retained_blocks: usize,
+    /// JSON-RPC + WebSocket listen address (`IP:PORT`).
+    pub rpc_listen_addr: String,
+    /// Maximum accepted JSON-RPC request body size (bytes).
+    pub rpc_max_body_bytes: usize,
+    /// Per-IP request-rate budget (requests/second).
+    pub rpc_rate_limit_per_sec: u32,
+    /// Maximum WebSocket subscriptions allowed per connection.
+    pub ws_max_subscriptions_per_conn: usize,
+    /// Enables fail-closed startup recovery coherence checks.
+    pub strict_recovery: bool,
+    /// Forces index rebuild from retained finalized events during startup.
+    pub repair_index: bool,
+    /// Skips mempool checkpoint ingestion during startup.
+    pub ignore_mempool_checkpoint: bool,
     /// Optional bounded run-step count for smoke testing.
     pub max_steps: Option<usize>,
     /// Optional persistence directory used for graceful shutdown checkpointing.
@@ -87,6 +113,15 @@ impl Default for NodeRuntimeConfig {
             slot_duration_ms: DEFAULT_SLOT_DURATION_MS,
             max_block_transactions: DEFAULT_MAX_BLOCK_TRANSACTIONS,
             max_pending_blocks: 512,
+            mempool_checkpoint_interval_ms: DEFAULT_MEMPOOL_CHECKPOINT_INTERVAL_MS,
+            index_max_retained_blocks: DEFAULT_INDEX_MAX_RETAINED_BLOCKS,
+            rpc_listen_addr: DEFAULT_RPC_LISTEN_ADDR.to_owned(),
+            rpc_max_body_bytes: DEFAULT_RPC_MAX_BODY_BYTES,
+            rpc_rate_limit_per_sec: DEFAULT_RPC_RATE_LIMIT_PER_SEC,
+            ws_max_subscriptions_per_conn: DEFAULT_WS_MAX_SUBSCRIPTIONS_PER_CONN,
+            strict_recovery: true,
+            repair_index: false,
+            ignore_mempool_checkpoint: false,
             max_steps: None,
             state_directory: None,
             producer_secret_key_hex: None,
@@ -95,6 +130,7 @@ impl Default for NodeRuntimeConfig {
 }
 
 /// CLI-time overrides that can modify loaded file configuration.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NodeRuntimeOverrides {
     /// Optional network override.
@@ -119,6 +155,24 @@ pub struct NodeRuntimeOverrides {
     pub max_block_transactions: Option<usize>,
     /// Optional max pending block queue override.
     pub max_pending_blocks: Option<usize>,
+    /// Optional mempool checkpoint interval override.
+    pub mempool_checkpoint_interval_ms: Option<u64>,
+    /// Optional finalized-index retention override.
+    pub index_max_retained_blocks: Option<usize>,
+    /// Optional RPC listen address override.
+    pub rpc_listen_addr: Option<String>,
+    /// Optional RPC max request-body bytes override.
+    pub rpc_max_body_bytes: Option<usize>,
+    /// Optional RPC requests/second rate-limit override.
+    pub rpc_rate_limit_per_sec: Option<u32>,
+    /// Optional WebSocket max-subscriptions-per-connection override.
+    pub ws_max_subscriptions_per_conn: Option<usize>,
+    /// Optional strict recovery toggle override.
+    pub strict_recovery: Option<bool>,
+    /// Optional index rebuild toggle override.
+    pub repair_index: Option<bool>,
+    /// Optional mempool-checkpoint recovery toggle override.
+    pub ignore_mempool_checkpoint: Option<bool>,
     /// Optional bounded step count override.
     pub max_steps: Option<usize>,
     /// Optional persistence directory override.
@@ -175,6 +229,33 @@ impl NodeRuntimeConfig {
         if let Some(max_pending_blocks) = overrides.max_pending_blocks {
             self.max_pending_blocks = max_pending_blocks;
         }
+        if let Some(mempool_checkpoint_interval_ms) = overrides.mempool_checkpoint_interval_ms {
+            self.mempool_checkpoint_interval_ms = mempool_checkpoint_interval_ms;
+        }
+        if let Some(index_max_retained_blocks) = overrides.index_max_retained_blocks {
+            self.index_max_retained_blocks = index_max_retained_blocks;
+        }
+        if let Some(rpc_listen_addr) = &overrides.rpc_listen_addr {
+            self.rpc_listen_addr.clone_from(rpc_listen_addr);
+        }
+        if let Some(rpc_max_body_bytes) = overrides.rpc_max_body_bytes {
+            self.rpc_max_body_bytes = rpc_max_body_bytes;
+        }
+        if let Some(rpc_rate_limit_per_sec) = overrides.rpc_rate_limit_per_sec {
+            self.rpc_rate_limit_per_sec = rpc_rate_limit_per_sec;
+        }
+        if let Some(ws_max_subscriptions_per_conn) = overrides.ws_max_subscriptions_per_conn {
+            self.ws_max_subscriptions_per_conn = ws_max_subscriptions_per_conn;
+        }
+        if let Some(strict_recovery) = overrides.strict_recovery {
+            self.strict_recovery = strict_recovery;
+        }
+        if let Some(repair_index) = overrides.repair_index {
+            self.repair_index = repair_index;
+        }
+        if let Some(ignore_mempool_checkpoint) = overrides.ignore_mempool_checkpoint {
+            self.ignore_mempool_checkpoint = ignore_mempool_checkpoint;
+        }
         if let Some(max_steps) = overrides.max_steps {
             self.max_steps = Some(max_steps);
         }
@@ -212,6 +293,36 @@ impl NodeRuntimeConfig {
         if self.max_pending_blocks == 0 {
             return Err(NodeConfigError::InvalidPendingBlockLimit {
                 max_pending_blocks: self.max_pending_blocks,
+            });
+        }
+        if self.mempool_checkpoint_interval_ms == 0 {
+            return Err(NodeConfigError::InvalidMempoolCheckpointIntervalMs {
+                mempool_checkpoint_interval_ms: self.mempool_checkpoint_interval_ms,
+            });
+        }
+        if self.index_max_retained_blocks == 0 {
+            return Err(NodeConfigError::InvalidIndexMaxRetainedBlocks {
+                index_max_retained_blocks: self.index_max_retained_blocks,
+            });
+        }
+        if self.rpc_max_body_bytes == 0 {
+            return Err(NodeConfigError::InvalidRpcMaxBodyBytes {
+                rpc_max_body_bytes: self.rpc_max_body_bytes,
+            });
+        }
+        if self.rpc_rate_limit_per_sec == 0 {
+            return Err(NodeConfigError::InvalidRpcRateLimitPerSec {
+                rpc_rate_limit_per_sec: self.rpc_rate_limit_per_sec,
+            });
+        }
+        if self.ws_max_subscriptions_per_conn == 0 {
+            return Err(NodeConfigError::InvalidWsMaxSubscriptionsPerConnection {
+                ws_max_subscriptions_per_conn: self.ws_max_subscriptions_per_conn,
+            });
+        }
+        if self.rpc_listen_addr.parse::<SocketAddr>().is_err() {
+            return Err(NodeConfigError::InvalidRpcListenAddr {
+                rpc_listen_addr: self.rpc_listen_addr.clone(),
             });
         }
         if self.min_pow_bits > MAX_POW_BITS {
@@ -308,6 +419,42 @@ pub enum NodeConfigError {
         /// Configured value.
         max_pending_blocks: usize,
     },
+    /// Mempool checkpoint interval must be non-zero.
+    #[error("invalid node config: mempool_checkpoint_interval_ms must be > 0")]
+    InvalidMempoolCheckpointIntervalMs {
+        /// Configured value.
+        mempool_checkpoint_interval_ms: u64,
+    },
+    /// Finalized-index retention bound must be non-zero.
+    #[error("invalid node config: index_max_retained_blocks must be > 0")]
+    InvalidIndexMaxRetainedBlocks {
+        /// Configured value.
+        index_max_retained_blocks: usize,
+    },
+    /// RPC listen address is not a valid `IP:PORT` socket address.
+    #[error("invalid node config: rpc_listen_addr must be a valid socket address")]
+    InvalidRpcListenAddr {
+        /// Configured value.
+        rpc_listen_addr: String,
+    },
+    /// RPC max request body size must be non-zero.
+    #[error("invalid node config: rpc_max_body_bytes must be > 0")]
+    InvalidRpcMaxBodyBytes {
+        /// Configured value.
+        rpc_max_body_bytes: usize,
+    },
+    /// RPC rate-limit budget must be non-zero.
+    #[error("invalid node config: rpc_rate_limit_per_sec must be > 0")]
+    InvalidRpcRateLimitPerSec {
+        /// Configured value.
+        rpc_rate_limit_per_sec: u32,
+    },
+    /// WS max subscriptions per connection must be non-zero.
+    #[error("invalid node config: ws_max_subscriptions_per_conn must be > 0")]
+    InvalidWsMaxSubscriptionsPerConnection {
+        /// Configured value.
+        ws_max_subscriptions_per_conn: usize,
+    },
     /// Minimum `PoW` bits must fit algorithm bounds.
     #[error(
         "invalid node config: min_pow_bits={min_pow_bits} exceeds supported maximum {max_pow_bits}"
@@ -377,6 +524,15 @@ event_loop_tick_ms = 300
 slot_duration_ms = 1000
 max_block_transactions = 512
 max_pending_blocks = 1024
+mempool_checkpoint_interval_ms = 2000
+index_max_retained_blocks = 4096
+rpc_listen_addr = "127.0.0.1:9555"
+rpc_max_body_bytes = 131072
+rpc_rate_limit_per_sec = 250
+ws_max_subscriptions_per_conn = 64
+strict_recovery = false
+repair_index = true
+ignore_mempool_checkpoint = true
 max_steps = 5
 state_directory = "state/devnet"
 "#;
@@ -394,6 +550,15 @@ state_directory = "state/devnet"
         assert_eq!(loaded.seed_domain, "seed.devnet.homa");
         assert_eq!(loaded.slot_duration_ms, 1000);
         assert_eq!(loaded.max_block_transactions, 512);
+        assert_eq!(loaded.mempool_checkpoint_interval_ms, 2000);
+        assert_eq!(loaded.index_max_retained_blocks, 4096);
+        assert_eq!(loaded.rpc_listen_addr, "127.0.0.1:9555");
+        assert_eq!(loaded.rpc_max_body_bytes, 131_072);
+        assert_eq!(loaded.rpc_rate_limit_per_sec, 250);
+        assert_eq!(loaded.ws_max_subscriptions_per_conn, 64);
+        assert!(!loaded.strict_recovery);
+        assert!(loaded.repair_index);
+        assert!(loaded.ignore_mempool_checkpoint);
         assert_eq!(loaded.max_steps, Some(5));
 
         let cleanup = fs::remove_file(path);
@@ -419,6 +584,42 @@ state_directory = "state/devnet"
     }
 
     #[test]
+    fn rejects_zero_mempool_checkpoint_interval() {
+        let config = NodeRuntimeConfig {
+            mempool_checkpoint_interval_ms: 0,
+            ..NodeRuntimeConfig::default()
+        };
+        let validation = config.validate();
+        assert!(
+            matches!(
+                validation,
+                Err(NodeConfigError::InvalidMempoolCheckpointIntervalMs {
+                    mempool_checkpoint_interval_ms: 0
+                })
+            ),
+            "zero mempool checkpoint interval must be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_index_retention_bound() {
+        let config = NodeRuntimeConfig {
+            index_max_retained_blocks: 0,
+            ..NodeRuntimeConfig::default()
+        };
+        let validation = config.validate();
+        assert!(
+            matches!(
+                validation,
+                Err(NodeConfigError::InvalidIndexMaxRetainedBlocks {
+                    index_max_retained_blocks: 0
+                })
+            ),
+            "zero finalized-index retention bound must be rejected"
+        );
+    }
+
+    #[test]
     fn overrides_apply_as_expected() {
         let mut config = NodeRuntimeConfig::default();
         let overrides = NodeRuntimeOverrides {
@@ -429,6 +630,15 @@ state_directory = "state/devnet"
             slot_duration_ms: Some(777),
             max_block_transactions: Some(33),
             max_pending_blocks: Some(12),
+            mempool_checkpoint_interval_ms: Some(3_333),
+            index_max_retained_blocks: Some(55),
+            rpc_listen_addr: Some("127.0.0.1:9777".to_owned()),
+            rpc_max_body_bytes: Some(65_536),
+            rpc_rate_limit_per_sec: Some(42),
+            ws_max_subscriptions_per_conn: Some(7),
+            strict_recovery: Some(false),
+            repair_index: Some(true),
+            ignore_mempool_checkpoint: Some(true),
             max_steps: Some(2),
             ..NodeRuntimeOverrides::default()
         };
@@ -448,6 +658,15 @@ state_directory = "state/devnet"
         assert_eq!(config.slot_duration_ms, 777);
         assert_eq!(config.max_block_transactions, 33);
         assert_eq!(config.max_pending_blocks, 12);
+        assert_eq!(config.mempool_checkpoint_interval_ms, 3_333);
+        assert_eq!(config.index_max_retained_blocks, 55);
+        assert_eq!(config.rpc_listen_addr, "127.0.0.1:9777");
+        assert_eq!(config.rpc_max_body_bytes, 65_536);
+        assert_eq!(config.rpc_rate_limit_per_sec, 42);
+        assert_eq!(config.ws_max_subscriptions_per_conn, 7);
+        assert!(!config.strict_recovery);
+        assert!(config.repair_index);
+        assert!(config.ignore_mempool_checkpoint);
         assert_eq!(config.max_steps, Some(2));
     }
 

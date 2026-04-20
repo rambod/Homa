@@ -6,3 +6,5 @@ pub mod cli;
 pub mod config;
 /// Long-running node daemon skeleton and runtime event loop wiring.
 pub mod daemon;
+/// JSON-RPC + WebSocket node API surface.
+pub mod rpc;

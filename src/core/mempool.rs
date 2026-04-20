@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::consensus::pow::{PowError, leading_zero_bits, transaction_pow_hash};
@@ -133,6 +134,15 @@ pub struct Mempool {
     sender_nonce_index: BTreeSet<(String, u64)>,
     sender_rate_windows: BTreeMap<String, RateWindow>,
     peer_rate_windows: BTreeMap<String, RateWindow>,
+}
+
+/// Persisted mempool entry used for durable checkpointing/recovery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MempoolCheckpointEntry {
+    /// Full transaction payload.
+    pub transaction: Transaction,
+    /// Observation timestamp used for TTL enforcement during restart recovery.
+    pub observed_at_unix_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -269,6 +279,12 @@ impl Mempool {
         self.transactions.len()
     }
 
+    /// Returns mempool admission policy configuration.
+    #[must_use]
+    pub const fn config(&self) -> MempoolConfig {
+        self.config
+    }
+
     /// Returns true when no transactions are queued.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -290,13 +306,61 @@ impl Mempool {
         self.insert_with_context(transaction, Some(peer_id), observed_at_unix_ms)
     }
 
+    /// Inserts one checkpoint-recovered transaction with full admission revalidation.
+    ///
+    /// Recovery inserts intentionally bypass sender/peer rate limiting because those windows
+    /// represent transient online traffic, not persisted safety constraints.
+    pub fn insert_recovered_checkpoint_entry(
+        &mut self,
+        entry: MempoolCheckpointEntry,
+        now_unix_ms: u64,
+    ) -> Result<TransactionId, MempoolError> {
+        self.insert_with_context_with_options(
+            entry.transaction,
+            None,
+            now_unix_ms,
+            entry.observed_at_unix_ms,
+            false,
+        )
+    }
+
+    /// Exports deterministic checkpoint entries for all queued transactions.
+    #[must_use]
+    pub fn checkpoint_entries(&self) -> Vec<MempoolCheckpointEntry> {
+        self.transactions
+            .values()
+            .map(|entry| MempoolCheckpointEntry {
+                transaction: entry.transaction.clone(),
+                observed_at_unix_ms: entry.observed_at_unix_ms,
+            })
+            .collect()
+    }
+
     fn insert_with_context(
         &mut self,
         transaction: Transaction,
         peer_id: Option<&str>,
         observed_at_unix_ms: u64,
     ) -> Result<TransactionId, MempoolError> {
-        let _ = self.prune_expired_at(observed_at_unix_ms);
+        self.insert_with_context_with_options(
+            transaction,
+            peer_id,
+            observed_at_unix_ms,
+            observed_at_unix_ms,
+            true,
+        )
+    }
+
+    fn insert_with_context_with_options(
+        &mut self,
+        transaction: Transaction,
+        peer_id: Option<&str>,
+        now_unix_ms: u64,
+        observed_at_unix_ms: u64,
+        enforce_rate_limits: bool,
+    ) -> Result<TransactionId, MempoolError> {
+        let observed_at_unix_ms = observed_at_unix_ms.min(now_unix_ms);
+        let _ = self.prune_expired_at(now_unix_ms);
 
         if self.transactions.len() >= self.config.max_transactions {
             return Err(MempoolError::Full {
@@ -313,9 +377,11 @@ impl Mempool {
         validate_address_for_network(&transaction.receiver, self.config.network)
             .map_err(|source| MempoolError::InvalidReceiverAddress { source })?;
 
-        self.enforce_sender_rate_limit(&transaction.sender, observed_at_unix_ms)?;
-        if let Some(peer) = peer_id {
-            self.enforce_peer_rate_limit(peer, observed_at_unix_ms)?;
+        if enforce_rate_limits {
+            self.enforce_sender_rate_limit(&transaction.sender, now_unix_ms)?;
+            if let Some(peer) = peer_id {
+                self.enforce_peer_rate_limit(peer, now_unix_ms)?;
+            }
         }
 
         let pow_hash = transaction_pow_hash(&transaction)

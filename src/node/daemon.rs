@@ -18,7 +18,16 @@ use crate::core::block::{Block, BlockError};
 use crate::core::genesis::{
     GENESIS_TIMESTAMP_UNIX_MS, GenesisError, default_genesis_allocations, forge_genesis,
 };
+use crate::core::indexer::{
+    FinalizedIndexer, FinalizedIndexerConfig, FinalizedIndexerDiagnostics, FinalizedIndexerError,
+    FinalizedIndexerPaths, IndexedAddressTimelineRecord, IndexedBlockRecord,
+    IndexedTransactionRecord,
+};
 use crate::core::mempool::{Mempool, MempoolConfig, MempoolError, TransactionId, transaction_id};
+use crate::core::mempool_checkpoint::{
+    MempoolCheckpointError, MempoolCheckpointPaths, persist_mempool_checkpoint,
+    recover_mempool_checkpoint,
+};
 use crate::core::recovery::{
     RecoveryError, RecoveryPaths, commit_state_snapshot_atomic, recover_chain_state,
 };
@@ -60,6 +69,10 @@ pub const DEFAULT_EVENT_LOOP_TICK_MS: u64 = 250;
 pub const DEFAULT_SLOT_DURATION_MS: u64 = 1_000;
 /// Default transaction cap for one locally produced block.
 pub const DEFAULT_MAX_BLOCK_TRANSACTIONS: usize = 1_024;
+/// Default periodic mempool checkpoint interval in milliseconds.
+pub const DEFAULT_MEMPOOL_CHECKPOINT_INTERVAL_MS: u64 = 10_000;
+/// Default finalized index retention bound (in finalized blocks).
+pub const DEFAULT_INDEX_MAX_RETAINED_BLOCKS: usize = 100_000;
 /// Scale used to normalize large genesis balances into practical leader-election weights.
 const NORMALIZED_GENESIS_STAKE_SCALE: u64 = 10_000;
 /// Maximum publish attempts for one locally produced block.
@@ -108,6 +121,16 @@ pub struct NodeDaemonConfig {
     pub max_block_transactions: usize,
     /// Maximum decoded pending blocks retained in-memory.
     pub max_pending_blocks: usize,
+    /// Interval for periodic mempool checkpoint flushes when persistence is enabled.
+    pub mempool_checkpoint_interval_ms: u64,
+    /// Maximum retained finalized blocks in durable index segments.
+    pub index_max_retained_blocks: usize,
+    /// Enables fail-closed startup coherence checks.
+    pub strict_recovery: bool,
+    /// Forces deterministic finalized-index rebuild from retained events on startup.
+    pub repair_index: bool,
+    /// Skips mempool checkpoint ingestion during startup recovery.
+    pub ignore_mempool_checkpoint: bool,
     /// Optional local producer secret key for block production.
     pub producer_secret_key: Option<[u8; SECRET_KEY_LENGTH]>,
 }
@@ -150,9 +173,29 @@ impl Default for NodeDaemonConfig {
             slot_duration_ms: DEFAULT_SLOT_DURATION_MS,
             max_block_transactions: DEFAULT_MAX_BLOCK_TRANSACTIONS,
             max_pending_blocks: DEFAULT_MAX_PENDING_BLOCKS,
+            mempool_checkpoint_interval_ms: DEFAULT_MEMPOOL_CHECKPOINT_INTERVAL_MS,
+            index_max_retained_blocks: DEFAULT_INDEX_MAX_RETAINED_BLOCKS,
+            strict_recovery: true,
+            repair_index: false,
+            ignore_mempool_checkpoint: false,
             producer_secret_key: None,
         }
     }
+}
+
+/// Explicit node daemon lifecycle phases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeLifecycleState {
+    /// Startup bootstrap and recovery checks.
+    Bootstrapping,
+    /// Snapshot import / catch-up in progress.
+    Syncing,
+    /// Ready for steady-state intake + block processing.
+    Ready,
+    /// Intake stopped while draining/persisting runtime state.
+    Draining,
+    /// Fully stopped; swarm detached.
+    Stopped,
 }
 
 /// One handled inbound gossip outcome at daemon boundary.
@@ -279,6 +322,29 @@ pub struct NodePersistenceReport {
     pub sync_checkpoint_bytes: usize,
     /// Number of encoded finalized-block checkpoint bytes written.
     pub finalized_block_checkpoint_bytes: usize,
+    /// Number of mempool checkpoint entries persisted.
+    pub mempool_checkpoint_entries: usize,
+    /// Number of encoded mempool checkpoint bytes written.
+    pub mempool_checkpoint_bytes: usize,
+    /// Number of retained finalized index blocks after flush.
+    pub index_retained_blocks: usize,
+    /// Next finalized index event sequence.
+    pub index_next_event_sequence: u64,
+}
+
+/// Startup recovery report emitted after daemon initialization from persisted state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NodeRecoveryReport {
+    /// Number of mempool checkpoint entries successfully recovered into mempool.
+    pub mempool_recovered: usize,
+    /// Number of recovered mempool entries dropped as invalid/stale.
+    pub mempool_dropped_invalid: usize,
+    /// Number of recovered mempool entries dropped due to duplicate/conflict conditions.
+    pub mempool_dropped_conflict: usize,
+    /// Whether startup rebuilt finalized indexes from retained finalized events.
+    pub index_rebuild_performed: bool,
+    /// Number of finalized events replayed into indexes during startup rebuild.
+    pub index_events_replayed: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -364,7 +430,7 @@ enum InboundBlockQueueAction {
 }
 
 impl NodeEventLoopReport {
-    const fn absorb(&mut self, other: Self) {
+    pub(crate) const fn absorb(&mut self, other: Self) {
         self.processed_swarm_events = self
             .processed_swarm_events
             .saturating_add(other.processed_swarm_events);
@@ -527,6 +593,18 @@ pub enum NodeDaemonError {
         /// Underlying sync-engine checkpoint error.
         source: SyncEngineError,
     },
+    /// Durable mempool checkpoint persistence/recovery failed.
+    #[error("node daemon mempool checkpoint persistence/recovery failed: {source}")]
+    MempoolCheckpoint {
+        /// Underlying mempool checkpoint error.
+        source: MempoolCheckpointError,
+    },
+    /// Durable finalized index persistence/recovery failed.
+    #[error("node daemon finalized index operation failed: {source}")]
+    Indexer {
+        /// Underlying indexer error.
+        source: FinalizedIndexerError,
+    },
     /// Finalized-block checkpoint encoding failed.
     #[error("node daemon finalized-block checkpoint encoding failed: {source}")]
     FinalizedBlockCheckpointEncode {
@@ -601,6 +679,32 @@ pub enum NodeDaemonError {
     /// Attached swarm stream closed unexpectedly.
     #[error("node daemon swarm stream closed")]
     SwarmClosed,
+    /// Inbound intake attempted while daemon is draining/stopped.
+    #[error("node daemon intake is unavailable in lifecycle state: {state:?}")]
+    IntakeStopped {
+        /// Current lifecycle state.
+        state: NodeLifecycleState,
+    },
+    /// Startup mempool/state coherence mismatch detected.
+    #[error(
+        "node daemon startup mempool/state coherence mismatch: invalid_entries={invalid_entries}"
+    )]
+    StartupMempoolStateMismatch {
+        /// Number of recovered mempool entries incompatible with recovered chain state.
+        invalid_entries: usize,
+    },
+    /// Startup finalized-index coherence mismatch detected.
+    #[error(
+        "node daemon startup finalized-index coherence mismatch at height {finalized_height}: indexed_hash={indexed_hash:?}, finalized_hash={finalized_hash:?}"
+    )]
+    StartupIndexMismatch {
+        /// Finalized tip height checked for coherence.
+        finalized_height: u64,
+        /// Indexed hash observed at finalized height.
+        indexed_hash: Option<[u8; 32]>,
+        /// Finalized block hash from recovered chain head.
+        finalized_hash: [u8; 32],
+    },
 }
 
 #[derive(Debug)]
@@ -625,6 +729,11 @@ pub struct NodeDaemon {
     inbound_slot_commitment_order: VecDeque<u64>,
     observability: Observability,
     stats: NodeRuntimeStats,
+    lifecycle_state: NodeLifecycleState,
+    recovery_report: NodeRecoveryReport,
+    persistence_directory: Option<std::path::PathBuf>,
+    indexer: Option<FinalizedIndexer>,
+    last_mempool_checkpoint_unix_ms: Option<u64>,
     swarm: Option<Swarm<HomaBehaviour>>,
 }
 
@@ -653,6 +762,10 @@ impl std::fmt::Debug for NodeDaemon {
             )
             .field("observability", &self.observability)
             .field("stats", &self.stats)
+            .field("lifecycle_state", &self.lifecycle_state)
+            .field("recovery_report", &self.recovery_report)
+            .field("persistence_directory", &self.persistence_directory)
+            .field("indexer_attached", &self.indexer.is_some())
             .field("swarm_attached", &self.swarm.is_some())
             .finish_non_exhaustive()
     }
@@ -671,13 +784,17 @@ impl NodeDaemon {
         let stake_ledger = stake_ledger_from_genesis(network)?;
         let (genesis_block, chain_state) =
             forge_genesis(network).map_err(|source| NodeDaemonError::Genesis { source })?;
-        Self::new(
+        let mut daemon = Self::new(
             config,
             genesis_block,
             chain_state,
             trusted_set,
             stake_ledger,
-        )
+        )?;
+        daemon.lifecycle_state = NodeLifecycleState::Bootstrapping;
+        daemon.validate_startup_coherence()?;
+        daemon.update_runtime_lifecycle_state();
+        Ok(daemon)
     }
 
     /// Creates a daemon from persisted state when available, otherwise bootstraps from genesis.
@@ -689,7 +806,11 @@ impl NodeDaemon {
             Ok(daemon) => Ok(daemon),
             Err(NodeDaemonError::Recovery {
                 source: RecoveryError::NoPersistedState,
-            }) => Self::from_genesis_with_config(config),
+            }) => {
+                let mut daemon = Self::from_genesis_with_config(config)?;
+                daemon.configure_persistence_directory(directory.to_path_buf())?;
+                Ok(daemon)
+            }
             Err(source) => Err(source),
         }
     }
@@ -723,9 +844,15 @@ impl NodeDaemon {
             trusted_set,
             stake_ledger,
         )?;
+        daemon.lifecycle_state = NodeLifecycleState::Bootstrapping;
         if let Some(sync_runtime) = recover_sync_runtime_for_daemon(&config, directory)? {
             daemon.sync_runtime = sync_runtime;
         }
+        if !config.ignore_mempool_checkpoint {
+            daemon.recovery_report =
+                recover_mempool_for_daemon(config.network, &mut daemon.mempool, directory)?;
+        }
+        daemon.configure_persistence_directory(directory.to_path_buf())?;
         Ok(daemon)
     }
 
@@ -787,6 +914,11 @@ impl NodeDaemon {
             inbound_slot_commitment_order: VecDeque::new(),
             observability,
             stats: NodeRuntimeStats::default(),
+            lifecycle_state: NodeLifecycleState::Ready,
+            recovery_report: NodeRecoveryReport::default(),
+            persistence_directory: None,
+            indexer: None,
+            last_mempool_checkpoint_unix_ms: None,
             swarm: None,
         })
     }
@@ -864,6 +996,7 @@ impl NodeDaemon {
     }
 
     /// Handles one inbound gossip tuple through runtime policy + sync + state gates.
+    #[allow(clippy::too_many_lines)]
     pub fn handle_inbound_gossip_message(
         &mut self,
         topic: &str,
@@ -871,6 +1004,14 @@ impl NodeDaemon {
         peer_id: &str,
         now_ms: u64,
     ) -> Result<NodeInboundOutcome, NodeDaemonError> {
+        if !matches!(
+            self.lifecycle_state,
+            NodeLifecycleState::Ready | NodeLifecycleState::Syncing
+        ) {
+            return Err(NodeDaemonError::IntakeStopped {
+                state: self.lifecycle_state,
+            });
+        }
         let action = handle_inbound_gossip_message_with_feedback_and_sync_runtime(
             &mut self.controller,
             &mut self.sync_runtime,
@@ -977,6 +1118,7 @@ impl NodeDaemon {
         &mut self,
         now_ms: u64,
     ) -> Result<NodeMaintenanceReport, NodeDaemonError> {
+        self.update_runtime_lifecycle_state();
         let timeout_feedback = self
             .sync_runtime
             .poll_timeout_feedback(now_ms)
@@ -992,6 +1134,7 @@ impl NodeDaemon {
 
         let block_processing = self.process_pending_blocks(self.config.max_pending_blocks)?;
         let production = self.maybe_produce_local_block(now_ms)?;
+        self.maybe_persist_mempool_checkpoint(now_ms)?;
 
         let import_mode = SnapshotImportMode::SteadyState {
             local_finalized_height: self.finalized_block.header.height,
@@ -1018,6 +1161,7 @@ impl NodeDaemon {
         let finalized_blocks = block_processing
             .finalized_blocks
             .saturating_add(production.produced_blocks);
+        self.update_runtime_lifecycle_state();
 
         Ok(NodeMaintenanceReport {
             retried_requests: timeout_feedback.retries.len(),
@@ -1319,6 +1463,12 @@ impl NodeDaemon {
             return Err(NodeDaemonError::FinalizedStateRootMismatch);
         }
 
+        if let Some(indexer) = self.indexer.as_ref() {
+            let _ = indexer
+                .append_finalized_block(&block, now_unix_ms())
+                .map_err(|source| NodeDaemonError::Indexer { source })?;
+        }
+
         self.remove_included_transactions_from_mempool(&block);
         self.chain_state = next_state;
         self.finalized_block = block;
@@ -1391,6 +1541,12 @@ impl NodeDaemon {
         &mut self,
         steps: usize,
     ) -> Result<NodeEventLoopReport, NodeDaemonError> {
+        if self.lifecycle_state == NodeLifecycleState::Stopped {
+            return Err(NodeDaemonError::IntakeStopped {
+                state: self.lifecycle_state,
+            });
+        }
+        self.update_runtime_lifecycle_state();
         let mut report = NodeEventLoopReport::default();
         for _ in 0..steps {
             let poll_interval = Duration::from_millis(self.config.event_loop_tick_ms);
@@ -1464,10 +1620,22 @@ impl NodeDaemon {
         self.stats
     }
 
+    /// Returns current daemon lifecycle state.
+    #[must_use]
+    pub const fn lifecycle_state(&self) -> NodeLifecycleState {
+        self.lifecycle_state
+    }
+
     /// Returns immutable chain state reference.
     #[must_use]
     pub const fn chain_state(&self) -> &ChainState {
         &self.chain_state
+    }
+
+    /// Returns configured network domain.
+    #[must_use]
+    pub const fn network(&self) -> Network {
+        self.config.network
     }
 
     /// Returns immutable finalized block metadata.
@@ -1480,6 +1648,26 @@ impl NodeDaemon {
     #[must_use]
     pub const fn observability(&self) -> &Observability {
         &self.observability
+    }
+
+    /// Returns startup recovery report for persisted mempool checkpoint ingestion.
+    #[must_use]
+    pub const fn recovery_report(&self) -> NodeRecoveryReport {
+        self.recovery_report
+    }
+
+    /// Configures persistence directory used by periodic mempool checkpoint ticks.
+    pub fn configure_persistence_directory(
+        &mut self,
+        directory: std::path::PathBuf,
+    ) -> Result<(), NodeDaemonError> {
+        self.indexer = None;
+        self.attach_indexer(&directory)?;
+        self.persistence_directory = Some(directory);
+        self.last_mempool_checkpoint_unix_ms = None;
+        self.validate_startup_coherence()?;
+        self.update_runtime_lifecycle_state();
+        Ok(())
     }
 
     /// Returns pending mempool transaction count.
@@ -1500,7 +1688,112 @@ impl NodeDaemon {
         self.sync_runtime.completed_snapshot_count()
     }
 
-    /// Persists chain state and sync-session runtime checkpoints atomically during shutdown.
+    /// Returns indexed finalized block record by height, when persistence/indexing is enabled.
+    pub fn indexed_block_by_height(
+        &self,
+        height: u64,
+    ) -> Result<Option<IndexedBlockRecord>, NodeDaemonError> {
+        let Some(indexer) = self.indexer.as_ref() else {
+            return Ok(None);
+        };
+        indexer
+            .get_block_by_height(height)
+            .map_err(|source| NodeDaemonError::Indexer { source })
+    }
+
+    /// Returns indexed finalized block record by hash, when persistence/indexing is enabled.
+    pub fn indexed_block_by_hash(
+        &self,
+        block_hash: &[u8; 32],
+    ) -> Result<Option<IndexedBlockRecord>, NodeDaemonError> {
+        let Some(indexer) = self.indexer.as_ref() else {
+            return Ok(None);
+        };
+        indexer
+            .get_block_by_hash(block_hash)
+            .map_err(|source| NodeDaemonError::Indexer { source })
+    }
+
+    /// Returns indexed transaction record by hash, when persistence/indexing is enabled.
+    pub fn indexed_transaction_by_hash(
+        &self,
+        tx_hash: &[u8; 32],
+    ) -> Result<Option<IndexedTransactionRecord>, NodeDaemonError> {
+        let Some(indexer) = self.indexer.as_ref() else {
+            return Ok(None);
+        };
+        indexer
+            .get_transaction_by_hash(tx_hash)
+            .map_err(|source| NodeDaemonError::Indexer { source })
+    }
+
+    /// Returns indexed transaction record by `(sender, nonce)`, when enabled.
+    pub fn indexed_transaction_by_sender_nonce(
+        &self,
+        sender: &str,
+        nonce: u64,
+    ) -> Result<Option<IndexedTransactionRecord>, NodeDaemonError> {
+        let Some(indexer) = self.indexer.as_ref() else {
+            return Ok(None);
+        };
+        indexer
+            .get_transaction_by_sender_nonce(sender, nonce)
+            .map_err(|source| NodeDaemonError::Indexer { source })
+    }
+
+    /// Returns indexed address timeline records, latest-first, when enabled.
+    pub fn indexed_address_timeline(
+        &self,
+        address: &str,
+        limit: usize,
+    ) -> Result<Vec<IndexedAddressTimelineRecord>, NodeDaemonError> {
+        let Some(indexer) = self.indexer.as_ref() else {
+            return Ok(Vec::new());
+        };
+        indexer
+            .get_address_timeline(address, limit)
+            .map_err(|source| NodeDaemonError::Indexer { source })
+    }
+
+    /// Returns finalized block payload by hash when known.
+    pub fn block_by_hash(&self, block_hash: &[u8; 32]) -> Result<Option<Block>, NodeDaemonError> {
+        let finalized_hash = self
+            .finalized_block
+            .hash()
+            .map_err(|source| NodeDaemonError::FinalizedBlockHash { source })?;
+        if &finalized_hash == block_hash {
+            return Ok(Some(self.finalized_block.clone()));
+        }
+        let indexed = self.indexed_block_by_hash(block_hash)?;
+        Ok(indexed.map(|record| record.block))
+    }
+
+    /// Returns current account `(balance, nonce)` snapshot for one address.
+    #[must_use]
+    pub fn account_balance_and_nonce(&self, address: &str) -> (u64, u64) {
+        let account = self.chain_state.account(address).unwrap_or_default();
+        (account.balance, account.nonce)
+    }
+
+    /// Returns one mempool transaction by deterministic hash when present.
+    #[must_use]
+    pub fn mempool_transaction_by_id(&self, tx_id: &TransactionId) -> Option<Transaction> {
+        self.mempool.get(tx_id).cloned()
+    }
+
+    /// Returns currently connected peer ids.
+    #[must_use]
+    pub fn connected_peer_ids(&self) -> Vec<String> {
+        let Some(swarm) = self.swarm.as_ref() else {
+            return Vec::new();
+        };
+        swarm
+            .connected_peers()
+            .map(std::string::ToString::to_string)
+            .collect()
+    }
+
+    /// Persists chain state, sync-session, finalized-block, and mempool checkpoints on shutdown.
     pub fn persist_runtime_state(
         &self,
         directory: &Path,
@@ -1522,13 +1815,49 @@ impl NodeDaemon {
         .map_err(|source| NodeDaemonError::SyncCheckpoint { source })?;
         let finalized_block_checkpoint_bytes =
             persist_finalized_block_checkpoint(&self.finalized_block, directory)?;
+        let mempool_paths = MempoolCheckpointPaths::new(directory.to_path_buf());
+        let mempool_checkpoint = persist_mempool_checkpoint(&self.mempool, &mempool_paths)
+            .map_err(|source| NodeDaemonError::MempoolCheckpoint { source })?;
+        let index_diagnostics = if let Some(indexer) = self.indexer.as_ref() {
+            indexer
+                .diagnostics()
+                .map_err(|source| NodeDaemonError::Indexer { source })?
+        } else {
+            FinalizedIndexerDiagnostics {
+                first_retained_sequence: 0,
+                next_event_sequence: 0,
+                retained_blocks: 0,
+            }
+        };
 
         Ok(NodePersistenceReport {
             state_height: state_commit.block_height,
             state_snapshot_bytes: state_commit.bytes_written,
             sync_checkpoint_bytes,
             finalized_block_checkpoint_bytes,
+            mempool_checkpoint_entries: mempool_checkpoint.entries_persisted,
+            mempool_checkpoint_bytes: mempool_checkpoint.bytes_written,
+            index_retained_blocks: index_diagnostics.retained_blocks,
+            index_next_event_sequence: index_diagnostics.next_event_sequence,
         })
+    }
+
+    /// Transitions daemon into draining shutdown, flushes persistence, and detaches swarm.
+    pub fn drain_and_stop(&mut self) -> Result<Option<NodePersistenceReport>, NodeDaemonError> {
+        if self.lifecycle_state == NodeLifecycleState::Stopped {
+            return Ok(None);
+        }
+
+        self.lifecycle_state = NodeLifecycleState::Draining;
+        let persistence_report = self
+            .persistence_directory
+            .as_deref()
+            .map(|directory| self.persist_runtime_state(directory))
+            .transpose()?;
+        self.indexer = None;
+        self.swarm = None;
+        self.lifecycle_state = NodeLifecycleState::Stopped;
+        Ok(persistence_report)
     }
 
     /// Returns current peer reputation score.
@@ -1653,9 +1982,160 @@ impl NodeDaemon {
         self.pending_blocks.push_back(block);
     }
 
+    fn attach_indexer(&mut self, directory: &Path) -> Result<(), NodeDaemonError> {
+        let paths = FinalizedIndexerPaths::new(directory.to_path_buf());
+        let (indexer, open_report) = FinalizedIndexer::open(
+            &paths,
+            self.config.network,
+            FinalizedIndexerConfig {
+                max_retained_blocks: self.config.index_max_retained_blocks,
+            },
+        )
+        .map_err(|source| NodeDaemonError::Indexer { source })?;
+        let mut rebuild_performed = open_report.rebuild_performed;
+        let mut events_replayed = open_report.events_replayed;
+        if self.config.repair_index {
+            let repaired = indexer
+                .rebuild_indexes()
+                .map_err(|source| NodeDaemonError::Indexer { source })?;
+            rebuild_performed = true;
+            events_replayed = events_replayed.saturating_add(repaired.events_replayed);
+        }
+        let _ = indexer
+            .ensure_finalized_block_indexed(&self.finalized_block, now_unix_ms())
+            .map_err(|source| NodeDaemonError::Indexer { source })?;
+
+        self.recovery_report.index_rebuild_performed = rebuild_performed;
+        self.recovery_report.index_events_replayed = events_replayed;
+        self.indexer = Some(indexer);
+        Ok(())
+    }
+
+    fn update_runtime_lifecycle_state(&mut self) {
+        if matches!(
+            self.lifecycle_state,
+            NodeLifecycleState::Draining | NodeLifecycleState::Stopped
+        ) {
+            return;
+        }
+        self.lifecycle_state = if self.sync_runtime.completed_snapshot_count() > 0 {
+            NodeLifecycleState::Syncing
+        } else {
+            NodeLifecycleState::Ready
+        };
+    }
+
+    fn validate_startup_coherence(&mut self) -> Result<(), NodeDaemonError> {
+        let scheduler_policy = self.sync_runtime.request_scheduler().policy();
+        let session_policy = self.sync_runtime.session_manager().policy();
+        if scheduler_policy != self.config.request_policy
+            || session_policy != self.config.session_policy
+        {
+            if self.config.strict_recovery {
+                if scheduler_policy != self.config.request_policy {
+                    return Err(NodeDaemonError::RecoveredSyncSchedulerPolicyMismatch {
+                        expected: self.config.request_policy,
+                        recovered: scheduler_policy,
+                    });
+                }
+                return Err(NodeDaemonError::RecoveredSyncSessionPolicyMismatch {
+                    expected: self.config.session_policy,
+                    recovered: session_policy,
+                });
+            }
+
+            self.sync_runtime = SyncRuntimeCoordinator::with_assembly_and_import_policy(
+                self.config.request_policy,
+                self.config.session_policy,
+                self.config.snapshot_chunk_bytes,
+                self.config.snapshot_admission_policy,
+                self.config.snapshot_import_failure_policy,
+            )
+            .map_err(|source| NodeDaemonError::SyncRuntimeConfig { source })?;
+        }
+
+        let mut incoherent_entries = 0_usize;
+        let candidates = self.mempool.prioritized_transactions(self.mempool.len());
+        let mut invalid_ids = Vec::new();
+        for (tx_id, transaction) in candidates {
+            if !transaction_is_coherent_with_chain_state(&self.chain_state, &transaction) {
+                incoherent_entries = incoherent_entries.saturating_add(1);
+                invalid_ids.push(tx_id);
+            }
+        }
+        if incoherent_entries > 0 {
+            if self.config.strict_recovery {
+                return Err(NodeDaemonError::StartupMempoolStateMismatch {
+                    invalid_entries: incoherent_entries,
+                });
+            }
+            for tx_id in invalid_ids {
+                let _ = self.mempool.remove(&tx_id);
+            }
+        }
+
+        if let Some(indexer) = self.indexer.as_ref() {
+            let finalized_hash = self
+                .finalized_block
+                .hash()
+                .map_err(|source| NodeDaemonError::FinalizedBlockHash { source })?;
+            let indexed = indexer
+                .get_block_by_height(self.finalized_block.header.height)
+                .map_err(|source| NodeDaemonError::Indexer { source })?;
+            let indexed_hash = indexed.as_ref().map(|record| record.block_hash);
+            if indexed_hash != Some(finalized_hash) {
+                if self.config.strict_recovery {
+                    return Err(NodeDaemonError::StartupIndexMismatch {
+                        finalized_height: self.finalized_block.header.height,
+                        indexed_hash,
+                        finalized_hash,
+                    });
+                }
+                let _ = indexer
+                    .ensure_finalized_block_indexed(&self.finalized_block, now_unix_ms())
+                    .map_err(|source| NodeDaemonError::Indexer { source })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn maybe_persist_mempool_checkpoint(&mut self, now_ms: u64) -> Result<(), NodeDaemonError> {
+        let Some(directory) = self.persistence_directory.as_deref() else {
+            return Ok(());
+        };
+
+        let should_persist =
+            self.last_mempool_checkpoint_unix_ms
+                .is_none_or(|last_checkpoint_ms| {
+                    now_ms.saturating_sub(last_checkpoint_ms)
+                        >= self.config.mempool_checkpoint_interval_ms
+                });
+        if !should_persist {
+            return Ok(());
+        }
+
+        let paths = MempoolCheckpointPaths::new(directory.to_path_buf());
+        let _ = persist_mempool_checkpoint(&self.mempool, &paths)
+            .map_err(|source| NodeDaemonError::MempoolCheckpoint { source })?;
+        self.last_mempool_checkpoint_unix_ms = Some(now_ms);
+        Ok(())
+    }
+
     fn swarm_mut(&mut self) -> Result<&mut Swarm<HomaBehaviour>, NodeDaemonError> {
         self.swarm.as_mut().ok_or(NodeDaemonError::MissingSwarm)
     }
+}
+
+fn transaction_is_coherent_with_chain_state(state: &ChainState, transaction: &Transaction) -> bool {
+    let Ok(required) = transaction.debited_total() else {
+        return false;
+    };
+    let sender_state = state.account(&transaction.sender).unwrap_or_default();
+    if transaction.nonce <= sender_state.nonce {
+        return false;
+    }
+    sender_state.balance >= required
 }
 
 fn local_block_producer_from_config(
@@ -1816,16 +2296,22 @@ fn recover_sync_runtime_for_daemon(
     };
 
     if scheduler.policy() != config.request_policy {
-        return Err(NodeDaemonError::RecoveredSyncSchedulerPolicyMismatch {
-            expected: config.request_policy,
-            recovered: scheduler.policy(),
-        });
+        if config.strict_recovery {
+            return Err(NodeDaemonError::RecoveredSyncSchedulerPolicyMismatch {
+                expected: config.request_policy,
+                recovered: scheduler.policy(),
+            });
+        }
+        return Ok(None);
     }
     if session_manager.policy() != config.session_policy {
-        return Err(NodeDaemonError::RecoveredSyncSessionPolicyMismatch {
-            expected: config.session_policy,
-            recovered: session_manager.policy(),
-        });
+        if config.strict_recovery {
+            return Err(NodeDaemonError::RecoveredSyncSessionPolicyMismatch {
+                expected: config.session_policy,
+                recovered: session_manager.policy(),
+            });
+        }
+        return Ok(None);
     }
 
     let _ = scheduler.abandon_in_flight_for_restart();
@@ -1843,11 +2329,51 @@ fn recover_sync_runtime_for_daemon(
     Ok(Some(sync_runtime))
 }
 
+fn recover_mempool_for_daemon(
+    network: Network,
+    mempool: &mut Mempool,
+    directory: &Path,
+) -> Result<NodeRecoveryReport, NodeDaemonError> {
+    let paths = MempoolCheckpointPaths::new(directory.to_path_buf());
+    let recovered = recover_mempool_checkpoint(&paths, network)
+        .map_err(|source| NodeDaemonError::MempoolCheckpoint { source })?;
+    let Some(entries) = recovered else {
+        return Ok(NodeRecoveryReport::default());
+    };
+
+    let now_ms = now_unix_ms();
+    let mut report = NodeRecoveryReport::default();
+    for entry in entries {
+        match mempool.insert_recovered_checkpoint_entry(entry, now_ms) {
+            Ok(_) => {
+                report.mempool_recovered = report.mempool_recovered.saturating_add(1);
+            }
+            Err(error) if is_mempool_recovery_conflict(&error) => {
+                report.mempool_dropped_conflict = report.mempool_dropped_conflict.saturating_add(1);
+            }
+            Err(_) => {
+                report.mempool_dropped_invalid = report.mempool_dropped_invalid.saturating_add(1);
+            }
+        }
+    }
+    Ok(report)
+}
+
+const fn is_mempool_recovery_conflict(error: &MempoolError) -> bool {
+    matches!(
+        error,
+        MempoolError::DuplicateSenderNonce {
+            sender: _,
+            nonce: _
+        } | MempoolError::DuplicateTransaction
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         DEFAULT_SLOT_DURATION_MS, FINALIZED_BLOCK_CHECKPOINT_FILE_NAME, InboundBlockAdmissionError,
-        NodeDaemon, NodeDaemonConfig, NodeDaemonError, NodeInboundOutcome,
+        NodeDaemon, NodeDaemonConfig, NodeDaemonError, NodeInboundOutcome, NodeLifecycleState,
         stake_ledger_from_genesis, trusted_checkpoint_set_from_genesis,
     };
     use crate::consensus::leader::elect_leader;
@@ -1855,7 +2381,12 @@ mod tests {
     use crate::core::genesis::{
         GENESIS_TIMESTAMP_UNIX_MS, default_genesis_allocations, forge_genesis,
     };
+    use crate::core::indexer::FINALIZED_INDEX_FILE_NAME;
+    use crate::core::mempool::MempoolCheckpointEntry;
     use crate::core::mempool::MempoolConfig;
+    use crate::core::mempool_checkpoint::{
+        MEMPOOL_CHECKPOINT_FILE_NAME, MempoolCheckpointPaths, persist_mempool_checkpoint_entries,
+    };
     use crate::core::recovery::SNAPSHOT_FILE_NAME;
     use crate::core::sync::{build_state_snapshot, split_snapshot_into_chunks};
     use crate::core::transaction::Transaction;
@@ -1867,7 +2398,7 @@ mod tests {
         encode_snapshot_chunk_response,
     };
     use crate::network::runtime_loop::RuntimeLoopError;
-    use crate::network::sync_engine::SYNC_SESSION_CHECKPOINT_FILE_NAME;
+    use crate::network::sync_engine::{RequestSchedulerPolicy, SYNC_SESSION_CHECKPOINT_FILE_NAME};
     use std::fs;
     use std::path::PathBuf;
 
@@ -2056,6 +2587,22 @@ mod tests {
 
         unsigned
             .with_signature(sender_keypair.sign(&signing_bytes.unwrap_or_else(|_| unreachable!())))
+    }
+
+    fn invalid_checkpoint_transaction(network: Network) -> Transaction {
+        let (sender_keypair, sender_address) = genesis_sender(network);
+        let receiver_keypair = Keypair::generate();
+        let receiver_address = derive_address(&receiver_keypair.public_key_bytes(), network);
+        assert!(receiver_address.is_ok(), "receiver address should derive");
+        Transaction::new_unsigned(
+            sender_address,
+            receiver_address.unwrap_or_else(|_| unreachable!()),
+            0,
+            1,
+            99,
+            0,
+        )
+        .with_sender_public_key(sender_keypair.public_key_bytes())
     }
 
     fn empty_child_block(
@@ -2827,7 +3374,7 @@ mod tests {
     }
 
     #[test]
-    fn persist_runtime_state_flushes_state_and_sync_checkpoint() {
+    fn persist_runtime_state_flushes_state_sync_and_mempool_checkpoints() {
         let daemon = daemon_with_low_pow(Network::Testnet);
         let directory = test_directory("homa-daemon-persist");
 
@@ -2849,10 +3396,15 @@ mod tests {
             persisted.finalized_block_checkpoint_bytes > 0,
             "finalized-block checkpoint persistence should report encoded bytes"
         );
+        assert_eq!(
+            persisted.mempool_checkpoint_entries, 0,
+            "empty mempool should persist with zero checkpoint entries"
+        );
 
         let snapshot_path = directory.join(SNAPSHOT_FILE_NAME);
         let sync_path = directory.join(SYNC_SESSION_CHECKPOINT_FILE_NAME);
         let finalized_path = directory.join(FINALIZED_BLOCK_CHECKPOINT_FILE_NAME);
+        let mempool_path = directory.join(MEMPOOL_CHECKPOINT_FILE_NAME);
         assert!(
             snapshot_path.exists(),
             "state snapshot file should be written"
@@ -2862,12 +3414,97 @@ mod tests {
             finalized_path.exists(),
             "finalized-block checkpoint file should be written"
         );
+        assert!(
+            mempool_path.exists(),
+            "mempool checkpoint file should be written"
+        );
 
         let cleanup = fs::remove_dir_all(&directory);
         assert!(
             cleanup.is_ok(),
             "test persistence directory should clean up"
         );
+    }
+
+    #[test]
+    fn maintenance_tick_indexes_finalized_transactions_when_persistence_is_configured() {
+        let network = Network::Testnet;
+        let mut daemon = daemon_with_local_producer(network);
+        let directory = test_directory("homa-daemon-indexer");
+        let configured = daemon.configure_persistence_directory(directory.clone());
+        assert!(configured.is_ok(), "persistence directory should configure");
+
+        let transaction = signed_transaction_from_genesis_sender(network, 1, 100, 2);
+        let tx_hash = crate::core::mempool::transaction_id(&transaction);
+        assert!(tx_hash.is_ok(), "transaction id should compute");
+        let tx_hash = tx_hash.unwrap_or_else(|_| unreachable!());
+        let encoded = transaction.encode();
+        assert!(encoded.is_ok(), "transaction should encode");
+        let admitted = daemon.handle_inbound_gossip_message(
+            TRANSACTIONS_TOPIC,
+            &encoded.unwrap_or_else(|_| unreachable!()),
+            "peer-indexed",
+            50_000,
+        );
+        assert!(admitted.is_ok(), "transaction should admit");
+
+        let local_producer = producer_address(network);
+        let slot = slot_for_leader(network, &local_producer, 0);
+        let now_ms = timestamp_for_slot(slot, DEFAULT_SLOT_DURATION_MS);
+        let maintenance = daemon.run_maintenance_tick(now_ms);
+        assert!(maintenance.is_ok(), "maintenance tick should succeed");
+        let maintenance = maintenance.unwrap_or_else(|_| unreachable!());
+        assert_eq!(maintenance.finalized_blocks, 1);
+
+        let indexed_block = daemon.indexed_block_by_height(1);
+        assert!(indexed_block.is_ok(), "indexed block lookup should succeed");
+        let indexed_block = indexed_block.unwrap_or_else(|_| unreachable!());
+        assert!(indexed_block.is_some(), "finalized block should be indexed");
+        assert_eq!(
+            indexed_block.unwrap_or_else(|| unreachable!()).height,
+            1,
+            "height-one block should be indexed"
+        );
+
+        let indexed_tx = daemon.indexed_transaction_by_hash(&tx_hash);
+        assert!(indexed_tx.is_ok(), "indexed tx lookup should succeed");
+        let indexed_tx = indexed_tx.unwrap_or_else(|_| unreachable!());
+        assert!(
+            indexed_tx.is_some(),
+            "finalized transaction should be indexed"
+        );
+        let indexed_tx = indexed_tx.unwrap_or_else(|| unreachable!());
+        assert_eq!(indexed_tx.nonce, 1);
+        assert_eq!(indexed_tx.fee, 2);
+
+        let by_sender_nonce = daemon.indexed_transaction_by_sender_nonce(&transaction.sender, 1);
+        assert!(
+            by_sender_nonce.is_ok(),
+            "sender+nonce lookup should succeed"
+        );
+        let by_sender_nonce = by_sender_nonce.unwrap_or_else(|_| unreachable!());
+        assert!(
+            by_sender_nonce.is_some(),
+            "sender+nonce index should map to finalized tx"
+        );
+
+        let sender_timeline = daemon.indexed_address_timeline(&transaction.sender, 16);
+        assert!(sender_timeline.is_ok(), "sender timeline should query");
+        assert!(
+            !sender_timeline
+                .unwrap_or_else(|_| unreachable!())
+                .is_empty(),
+            "sender timeline should include finalized tx"
+        );
+
+        let index_path = directory.join(FINALIZED_INDEX_FILE_NAME);
+        assert!(
+            index_path.exists(),
+            "finalized index file should be written"
+        );
+
+        let cleanup = fs::remove_dir_all(&directory);
+        assert!(cleanup.is_ok(), "test directory should clean up");
     }
 
     #[test]
@@ -2938,6 +3575,127 @@ mod tests {
             cleanup.is_ok(),
             "test persistence directory should clean up"
         );
+    }
+
+    #[test]
+    fn from_persisted_or_genesis_recovers_mempool_checkpoint_entries() {
+        let network = Network::Testnet;
+        let mut daemon = daemon_with_low_pow(network);
+        let transaction = signed_transaction_from_genesis_sender(network, 1, 10, 1);
+        let encoded = transaction.encode();
+        assert!(encoded.is_ok(), "transaction should encode");
+        let admitted = daemon.handle_inbound_gossip_message(
+            TRANSACTIONS_TOPIC,
+            &encoded.unwrap_or_else(|_| unreachable!()),
+            "peer-recovery",
+            25_000,
+        );
+        assert!(admitted.is_ok(), "transaction should be admitted");
+        assert_eq!(daemon.mempool_len(), 1);
+
+        let directory = test_directory("homa-daemon-mempool-recover");
+        let persisted = daemon.persist_runtime_state(&directory);
+        assert!(persisted.is_ok(), "persist should succeed");
+
+        let mut config = NodeDaemonConfig::for_network(network);
+        config.mempool_config = MempoolConfig::new(10_000, 0, network);
+        config.max_pending_blocks = 16;
+        let recovered = NodeDaemon::from_persisted_or_genesis(config, &directory);
+        assert!(recovered.is_ok(), "recovery should succeed");
+        let recovered = recovered.unwrap_or_else(|_| unreachable!());
+        assert_eq!(recovered.mempool_len(), 1, "mempool entry should recover");
+        let recovery_report = recovered.recovery_report();
+        assert_eq!(recovery_report.mempool_recovered, 1);
+        assert_eq!(recovery_report.mempool_dropped_invalid, 0);
+        assert_eq!(recovery_report.mempool_dropped_conflict, 0);
+
+        let cleanup = fs::remove_dir_all(&directory);
+        assert!(cleanup.is_ok(), "test directory should clean up");
+    }
+
+    #[test]
+    fn from_persisted_or_genesis_tracks_invalid_and_conflicting_mempool_recovery_drops() {
+        let network = Network::Testnet;
+        let daemon = daemon_with_low_pow(network);
+        let directory = test_directory("homa-daemon-mempool-drop-accounting");
+        let persisted = daemon.persist_runtime_state(&directory);
+        assert!(persisted.is_ok(), "persist should succeed");
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0_u64, |duration| {
+                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+            });
+
+        let checkpoint_entries = vec![
+            MempoolCheckpointEntry {
+                transaction: signed_transaction_from_genesis_sender(network, 1, 10, 1),
+                observed_at_unix_ms: now_ms,
+            },
+            MempoolCheckpointEntry {
+                transaction: signed_transaction_from_genesis_sender(network, 1, 11, 1),
+                observed_at_unix_ms: now_ms.saturating_add(1),
+            },
+            MempoolCheckpointEntry {
+                transaction: invalid_checkpoint_transaction(network),
+                observed_at_unix_ms: now_ms.saturating_add(2),
+            },
+        ];
+        let mempool_paths = MempoolCheckpointPaths::new(directory.clone());
+        let checkpoint_persisted =
+            persist_mempool_checkpoint_entries(&checkpoint_entries, network, &mempool_paths);
+        assert!(
+            checkpoint_persisted.is_ok(),
+            "explicit mempool checkpoint should persist"
+        );
+
+        let mut config = NodeDaemonConfig::for_network(network);
+        config.mempool_config = MempoolConfig::new(10_000, 0, network);
+        config.max_pending_blocks = 16;
+        let recovered = NodeDaemon::from_persisted_or_genesis(config, &directory);
+        assert!(recovered.is_ok(), "recovery should succeed");
+        let recovered = recovered.unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            recovered.mempool_len(),
+            1,
+            "only one valid, non-conflicting checkpoint tx should recover"
+        );
+        let recovery_report = recovered.recovery_report();
+        assert_eq!(recovery_report.mempool_recovered, 1);
+        assert_eq!(recovery_report.mempool_dropped_conflict, 1);
+        assert_eq!(recovery_report.mempool_dropped_invalid, 1);
+
+        let cleanup = fs::remove_dir_all(&directory);
+        assert!(cleanup.is_ok(), "test directory should clean up");
+    }
+
+    #[test]
+    fn maintenance_tick_persists_mempool_checkpoint_when_directory_is_configured() {
+        let network = Network::Testnet;
+        let mut daemon = daemon_with_low_pow(network);
+        daemon.config.mempool_checkpoint_interval_ms = 1;
+        let directory = test_directory("homa-daemon-periodic-mempool-checkpoint");
+        let configured = daemon.configure_persistence_directory(directory.clone());
+        assert!(configured.is_ok(), "persistence directory should configure");
+        let transaction = signed_transaction_from_genesis_sender(network, 1, 10, 1);
+        let encoded = transaction.encode();
+        assert!(encoded.is_ok(), "transaction should encode");
+        let admitted = daemon.handle_inbound_gossip_message(
+            TRANSACTIONS_TOPIC,
+            &encoded.unwrap_or_else(|_| unreachable!()),
+            "peer-periodic",
+            40_000,
+        );
+        assert!(admitted.is_ok(), "transaction should be admitted");
+
+        let maintenance = daemon.run_maintenance_tick(40_001);
+        assert!(maintenance.is_ok(), "maintenance tick should succeed");
+        assert!(
+            directory.join(MEMPOOL_CHECKPOINT_FILE_NAME).exists(),
+            "maintenance tick should write periodic mempool checkpoint"
+        );
+
+        let cleanup = fs::remove_dir_all(&directory);
+        assert!(cleanup.is_ok(), "test directory should clean up");
     }
 
     #[test]
@@ -3059,5 +3817,221 @@ mod tests {
             cleanup.is_ok(),
             "test persistence directory should clean up"
         );
+    }
+
+    #[test]
+    fn from_genesis_with_config_transitions_to_ready_lifecycle() {
+        let mut config = NodeDaemonConfig::for_network(Network::Testnet);
+        config.mempool_config = MempoolConfig::new(10_000, 0, Network::Testnet);
+        config.max_pending_blocks = 16;
+        let daemon = NodeDaemon::from_genesis_with_config(config);
+        assert!(daemon.is_ok(), "daemon should initialize from genesis");
+        let daemon = daemon.unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            daemon.lifecycle_state(),
+            NodeLifecycleState::Ready,
+            "genesis startup should settle to ready lifecycle state"
+        );
+    }
+
+    #[test]
+    fn strict_recovery_rejects_sync_policy_mismatch_on_startup() {
+        let network = Network::Testnet;
+        let daemon = daemon_with_low_pow(network);
+        let directory = test_directory("homa-daemon-strict-sync-mismatch");
+        let persisted = daemon.persist_runtime_state(&directory);
+        assert!(persisted.is_ok(), "persist should succeed");
+
+        let mut config = NodeDaemonConfig::for_network(network);
+        config.mempool_config = MempoolConfig::new(10_000, 0, network);
+        config.max_pending_blocks = 16;
+        config.request_policy = RequestSchedulerPolicy {
+            max_retries: config.request_policy.max_retries.saturating_add(1),
+            ..config.request_policy
+        };
+        config.strict_recovery = true;
+
+        let restored = NodeDaemon::from_persisted_or_genesis(config, &directory);
+        assert!(
+            matches!(
+                restored,
+                Err(NodeDaemonError::RecoveredSyncSchedulerPolicyMismatch {
+                    expected: _,
+                    recovered: _
+                })
+            ),
+            "strict recovery should fail closed when recovered sync scheduler policy mismatches startup config"
+        );
+
+        let cleanup = fs::remove_dir_all(&directory);
+        assert!(cleanup.is_ok(), "test directory should clean up");
+    }
+
+    #[test]
+    fn non_strict_recovery_replaces_mismatched_sync_policy() {
+        let network = Network::Testnet;
+        let daemon = daemon_with_low_pow(network);
+        let directory = test_directory("homa-daemon-relaxed-sync-mismatch");
+        let persisted = daemon.persist_runtime_state(&directory);
+        assert!(persisted.is_ok(), "persist should succeed");
+
+        let mut config = NodeDaemonConfig::for_network(network);
+        config.mempool_config = MempoolConfig::new(10_000, 0, network);
+        config.max_pending_blocks = 16;
+        config.request_policy = RequestSchedulerPolicy {
+            max_retries: config.request_policy.max_retries.saturating_add(1),
+            ..config.request_policy
+        };
+        config.strict_recovery = false;
+
+        let restored = NodeDaemon::from_persisted_or_genesis(config, &directory);
+        assert!(
+            restored.is_ok(),
+            "non-strict recovery should replace mismatched sync policy and continue startup: {restored:?}"
+        );
+        let mut restored = restored.unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            restored.sync_runtime_mut().request_scheduler().policy(),
+            config.request_policy,
+            "recovered runtime should adopt configured scheduler policy in non-strict mode"
+        );
+        assert_eq!(
+            restored.lifecycle_state(),
+            NodeLifecycleState::Ready,
+            "daemon should still transition to ready in non-strict mode"
+        );
+
+        let cleanup = fs::remove_dir_all(&directory);
+        assert!(cleanup.is_ok(), "test directory should clean up");
+    }
+
+    #[test]
+    fn ignore_mempool_checkpoint_skips_recovery_entries() {
+        let network = Network::Testnet;
+        let mut daemon = daemon_with_low_pow(network);
+        let transaction = signed_transaction_from_genesis_sender(network, 1, 10, 1);
+        let encoded = transaction.encode();
+        assert!(encoded.is_ok(), "transaction should encode");
+        let admitted = daemon.handle_inbound_gossip_message(
+            TRANSACTIONS_TOPIC,
+            &encoded.unwrap_or_else(|_| unreachable!()),
+            "peer-ignore-mempool",
+            60_000,
+        );
+        assert!(admitted.is_ok(), "transaction should be admitted");
+        assert_eq!(daemon.mempool_len(), 1);
+
+        let directory = test_directory("homa-daemon-ignore-mempool");
+        let persisted = daemon.persist_runtime_state(&directory);
+        assert!(persisted.is_ok(), "persist should succeed");
+
+        let mut config = NodeDaemonConfig::for_network(network);
+        config.mempool_config = MempoolConfig::new(10_000, 0, network);
+        config.max_pending_blocks = 16;
+        config.ignore_mempool_checkpoint = true;
+
+        let restored = NodeDaemon::from_persisted_or_genesis(config, &directory);
+        assert!(
+            restored.is_ok(),
+            "recovery should succeed when mempool checkpoint ingestion is disabled"
+        );
+        let restored = restored.unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            restored.mempool_len(),
+            0,
+            "mempool checkpoint entries should be ignored on startup"
+        );
+        assert_eq!(
+            restored.recovery_report().mempool_recovered,
+            0,
+            "mempool recovery counter should stay zero when ingestion is disabled"
+        );
+
+        let cleanup = fs::remove_dir_all(&directory);
+        assert!(cleanup.is_ok(), "test directory should clean up");
+    }
+
+    #[test]
+    fn repair_index_mode_marks_rebuild_in_recovery_report() {
+        let network = Network::Testnet;
+        let mut daemon = daemon_with_local_producer(network);
+        let directory = test_directory("homa-daemon-repair-index");
+        let configured = daemon.configure_persistence_directory(directory.clone());
+        assert!(configured.is_ok(), "persistence directory should configure");
+        let persisted = daemon.persist_runtime_state(&directory);
+        assert!(persisted.is_ok(), "persist should succeed");
+        let drained = daemon.drain_and_stop();
+        assert!(
+            drained.is_ok(),
+            "initial daemon should close index db handle before restart simulation"
+        );
+
+        let mut config = NodeDaemonConfig::for_network(network);
+        config.mempool_config = MempoolConfig::new(10_000, 0, network);
+        config.max_pending_blocks = 16;
+        config.repair_index = true;
+
+        let restored = NodeDaemon::from_persisted_or_genesis(config, &directory);
+        assert!(
+            restored.is_ok(),
+            "recovery should succeed with explicit repair-index mode: {restored:?}"
+        );
+        let restored = restored.unwrap_or_else(|_| unreachable!());
+        let recovery = restored.recovery_report();
+        assert!(
+            recovery.index_rebuild_performed,
+            "repair-index mode should report rebuild as performed"
+        );
+
+        let cleanup = fs::remove_dir_all(&directory);
+        assert!(cleanup.is_ok(), "test directory should clean up");
+    }
+
+    #[test]
+    fn drain_and_stop_transitions_lifecycle_and_blocks_new_intake() {
+        let network = Network::Testnet;
+        let mut daemon = daemon_with_low_pow(network);
+        let directory = test_directory("homa-daemon-drain-stop");
+        let configured = daemon.configure_persistence_directory(directory.clone());
+        assert!(configured.is_ok(), "persistence directory should configure");
+
+        let drained = daemon.drain_and_stop();
+        assert!(drained.is_ok(), "drain and stop should succeed");
+        let drained = drained.unwrap_or_else(|_| unreachable!());
+        assert!(
+            drained.is_some(),
+            "drain should emit persistence report when persistence is configured"
+        );
+        assert_eq!(
+            daemon.lifecycle_state(),
+            NodeLifecycleState::Stopped,
+            "drain should transition daemon to stopped lifecycle state"
+        );
+
+        let rejected = daemon.handle_inbound_gossip_message(
+            TRANSACTIONS_TOPIC,
+            &[0_u8; 1],
+            "peer-after-stop",
+            70_000,
+        );
+        assert!(
+            matches!(
+                rejected,
+                Err(NodeDaemonError::IntakeStopped {
+                    state: NodeLifecycleState::Stopped
+                })
+            ),
+            "inbound intake must reject messages after stop transition"
+        );
+
+        let second = daemon.drain_and_stop();
+        assert!(second.is_ok(), "second drain call should be harmless");
+        assert!(
+            second.unwrap_or_else(|_| unreachable!()).is_none(),
+            "second drain call should not persist again when already stopped"
+        );
+
+        let cleanup = fs::remove_dir_all(&directory);
+        assert!(cleanup.is_ok(), "test directory should clean up");
     }
 }
