@@ -5,7 +5,7 @@ Homa is a pure Rust Layer-1 blockchain project implementing a hybrid model:
 - stake-weighted proposer selection (PoS side)
 - client-side proof-of-work per transaction (PoW side)
 
-This repository currently contains the protocol core, networking/sync hardening primitives, a node daemon CLI (`homa-node`), and a wallet CLI (`homa-cli`).
+This repository currently contains the protocol core, networking/sync hardening primitives, a node daemon CLI (`homa-node`), JSON-RPC/WebSocket node APIs, validator/operator CLI helpers, and a wallet CLI (`homa-cli`).
 
 ## Project Status
 
@@ -24,15 +24,21 @@ Implemented in this repository today:
 - proposer identity binding for blocks (signature + proposer public key + derived-address match)
 - inbound replay/continuity guards (stale-height rejection and finalized-boundary parent-hash enforcement)
 - crash-safe daemon restart recovery from persisted state snapshots + finalized-block checkpoints
+- durable mempool checkpoints with restart revalidation and conflict accounting
+- durable finalized-block indexer with tx/block/address lookup indexes and rebuild/compaction flow
+- explicit daemon lifecycle states with graceful drain/stop persistence
+- JSON-RPC and WebSocket API surface for status, blocks, balances, transactions, mempool, peers, and subscriptions
+- validator/operator CLI helpers for status, key rotation, snapshot movement, and checkpoint-rotation submission files
 - wallet CLI for key generation and transaction broadcasting
 - deterministic chaos and fuzz testing harnesses
 
-Not implemented yet (production gaps):
+Not production-ready yet (remaining major gaps):
 
-- full production node-daemon lifecycle (current daemon is a pre-alpha skeleton)
-- RPC/REST/GraphQL APIs
-- persistent mempool/indexer pipeline
-- validator operations tooling and deployment automation
+- distributed validator quorum/finality certificates beyond local proposer self-finalization
+- on-chain validator/staking lifecycle, validator-set epochs, and unbonding/slashing policy
+- end-to-end real multi-node devnet automation that proves libp2p gossip, sync serving, RPC, persistence, and block production together
+- production deployment hardening: generated per-node configs, stable listen ports, secret handling, metrics/alerting, backup drills, and release artifacts
+- external security review, expanded fuzz/property coverage, and mainnet genesis ceremony process
 
 ## Design Highlights
 
@@ -60,8 +66,10 @@ Not implemented yet (production gaps):
 - `src/core/`
   - `transaction.rs`: signed tx model + zero-copy decode path
   - `mempool.rs`: admission controls, TTL pruning, rate limits
+  - `mempool_checkpoint.rs`: durable mempool persistence/recovery
   - `block.rs`: block/header serialization + integrity checks
   - `state.rs`: account state machine and block application
+  - `indexer.rs`: durable finalized block/transaction/address indexes
   - `fork_choice.rs`: deterministic branch selection + reconciliation
   - `sync.rs`: snapshot/chunk/checkpoint verification and import
   - `recovery.rs`: crash-safe snapshot/WAL commit and recovery
@@ -74,6 +82,7 @@ Not implemented yet (production gaps):
 - `src/node/`
   - `daemon.rs`: daemon runtime integrating inbound runtime loop, pending-block finalization, slot-scheduled block production, sync maintenance, and swarm polling
   - `config.rs`: typed `node.toml` config loading and startup validation
+  - `rpc.rs`: JSON-RPC and WebSocket API server
   - `cli.rs`: node daemon command-line entrypoint
 - `src/observability/`
   - structured counters/events (`slot_miss`, `gossip_failure`, `sync_lag`)
@@ -222,6 +231,10 @@ Useful options:
 - `--max-steps <USIZE>` bounded event-loop steps for smoke/automation
 - `--state-directory <PATH>` enable graceful shutdown persistence flush (state snapshot + sync checkpoint)
 - `--producer-secret-key-hex <HEX>` enable local block production with a 32-byte Ed25519 secret key
+- `--rpc-listen-addr <IP:PORT>` JSON-RPC and WebSocket listen address
+- `--strict-recovery <BOOL>` fail closed on recovered-state coherence issues
+- `--repair-index <BOOL>` rebuild retained finalized indexes on startup
+- `--ignore-mempool-checkpoint <BOOL>` skip mempool checkpoint ingestion during startup
 
 Runtime behavior notes:
 
@@ -233,6 +246,36 @@ Runtime behavior notes:
 - pending blocks are finalized only when height and parent hash match the current finalized tip
 - invalid/stale blocks are rejected; out-of-order future blocks are retained until parent blocks arrive
 - transactions included in finalized blocks are evicted from mempool
+
+## JSON-RPC and WebSocket API
+
+When `homa-node run` is started without `--max-steps`, the node starts HTTP JSON-RPC on `rpc_listen_addr` and WebSocket subscriptions on `/ws`.
+
+JSON-RPC methods currently implemented:
+
+- `homa_getStatus`
+- `homa_getBlockByHeight`
+- `homa_getBlockByHash`
+- `homa_getBalance`
+- `homa_getTransaction`
+- `homa_sendRawTransaction`
+- `homa_getMempoolStats`
+- `homa_getPeers`
+
+Example:
+
+```bash
+curl -s http://127.0.0.1:8545 \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"homa_getStatus"}'
+```
+
+WebSocket channels currently implemented:
+
+- `newHeads`
+- `txAccepted`
+- `syncStatus`
+- `peerReputationEvents`
 
 ## Security Model (Current)
 
@@ -301,8 +344,9 @@ Targets:
 The active architecture + implementation tracker is:
 
 - `Homa_Architecture_and_Implementation_Plan.md`
+- `docs/PROJECT_ROADMAP.md`
 
-This document is used as the project’s living phase/task source of truth.
+The architecture plan is the long-form phase history. `docs/PROJECT_ROADMAP.md` is the current audit snapshot and near-term execution backlog.
 
 ## Development Principles in This Repo
 

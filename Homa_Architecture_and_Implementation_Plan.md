@@ -1,5 +1,6 @@
 # Homa (HMA) - Architecture and Implementation Plan
-**Version:** 1.0.0
+**Version:** 1.1.0
+**Last Audited:** 2026-04-25
 **Author:** Rambod (@RambodDev)
 **Network Focus:** Pure Layer-1 Currency | Instant Finality | Zero Inflation | Hybrid PoS + Client PoW
 
@@ -596,3 +597,121 @@ Add a production-oriented API surface for node query/submission and operator obs
   - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
   - `cargo test --workspace --all-targets`
   - `bash scripts/release_gate.sh`
+
+---
+
+## 35. Current Audit Snapshot (2026-04-25)
+
+This audit reviewed the tracked source, tests, deploy assets, runbooks, and project documentation. The README production-gap list was stale: JSON-RPC, durable mempool persistence, durable finalized indexing, daemon lifecycle state, and validator/operator CLI helpers are already implemented.
+
+### Implemented Baseline
+
+- [x] **Protocol Core:** Transactions, blocks, account state, genesis, fork choice, recovery, sync snapshots, mempool, mempool checkpointing, and finalized indexing are implemented under `src/core/`.
+- [x] **Consensus Primitives:** Stake ledger, deterministic leader election, client-side PoW, slot miss observability, and genesis-derived proposer scheduling are implemented under `src/consensus/`.
+- [x] **Network Boundary:** Libp2p swarm setup, gossipsub topics, DHT bootstrap helpers, bounded gossip decode, sync wire codecs, reputation, policy controller, checkpoint trust rotation, sync engine, and sync runtime are implemented under `src/network/`.
+- [x] **Node Runtime:** Daemon lifecycle states, local block production, inbound consensus admission, pending block finalization, persistence, restart recovery, RPC/WS integration, and CLI config loading are implemented under `src/node/`.
+- [x] **Wallet and Operator CLI:** Encrypted wallet generation, signed transaction send path, validator key/status/snapshot/checkpoint helper commands are implemented.
+- [x] **Quality Gates:** Unit tests, integration chaos tests, deterministic partition chaos fuzzer, cargo-fuzz targets, CI release gate, `cargo-audit`, and `cargo-deny` gates exist.
+
+### Remaining Production Gaps
+
+- [ ] **Distributed Finality:** Current finalization is proposer/local-state driven. Production needs validator votes, quorum certificates, certificate gossip, and fail-closed finality checks.
+- [ ] **On-Chain Validator Lifecycle:** Validator set and stake weights are genesis/bootstrap derived. Production needs registration, staking, unstaking, epoch activation, unbonding, and slashing/evidence handling.
+- [ ] **End-to-End Sync Transport:** Sync codecs, scheduling, and runtime assembly exist, but daemon-level request publication, chunk serving, response publication, and real-swarm tests must be completed.
+- [ ] **Devnet Automation:** Docker/systemd assets exist, but per-node generated configs, stable P2P ports, container RPC bind addresses, producer keys, bootstrap multiaddrs, and state volumes need a reliable one-command workflow.
+- [ ] **Observability Export:** In-process counters/events exist; production needs metrics export, alert rules, dashboards, and structured log conventions.
+- [ ] **Operational Runbooks:** Baseline runbooks now include commands and checks, but production still needs drill-validated procedures, rollback criteria, ownership, and incident decision trees.
+- [ ] **Security Release Readiness:** Mainnet readiness requires threat modeling, external review, longer fuzz/soak runs, reproducible artifacts, key-management policy, and genesis ceremony tooling.
+
+---
+
+## 36. Phase 34: Distributed Finality & Validator Quorum (Expansion V28)
+
+Move from local proposer self-finalization to network-finalized blocks backed by validator quorum certificates.
+
+### Task List
+
+- [ ] **Finality Vote Model:** Define validator vote/attestation payloads with domain-separated signing bytes, block hash binding, height/round/slot metadata, and validator address binding.
+- [ ] **Finality Certificate:** Define compact quorum certificates containing validator signatures, aggregate metadata, threshold validation, and deterministic encoding.
+- [ ] **Vote Gossip Topic:** Add a bounded `finality-votes` gossip topic with decode limits, duplicate vote suppression, equivocation detection, and reputation feedback.
+- [ ] **Certificate-Gated Finalization:** Require valid quorum certificates before advancing finalized height for network-received blocks. Keep self-finalization only as explicit dev/test mode.
+- [ ] **Fork/Partition Semantics:** Update fork choice and partition recovery so finalized certificates dominate local branch preference and prevent finalized-height rollback.
+- [ ] **RPC/Indexer Exposure:** Index finality certificate metadata and expose it in `homa_getStatus`, block lookups, and new finality-specific RPC fields.
+- [ ] **Regression Coverage:** Add multi-validator tests for normal quorum finality, delayed votes, missing votes, conflicting votes, invalid certificates, partition heal, and equivocation evidence.
+
+---
+
+## 37. Phase 35: On-Chain Validator & Staking Lifecycle (Expansion V29)
+
+Replace static genesis-derived validator membership with deterministic on-chain validator state transitions.
+
+### Task List
+
+- [ ] **Staking Operation Design:** Decide whether validator operations are dedicated transaction variants or a separate signed validator-operation protocol.
+- [ ] **Validator Registry State:** Add active/pending/exiting validator records, stake balances, activation epochs, unbonding queues, and operator metadata.
+- [ ] **Epoch Transition Rules:** Apply validator set changes only at deterministic epoch boundaries with activation/unbonding delay.
+- [ ] **Stake Accounting Integration:** Connect validator registry snapshots to leader election, finality quorum membership, checkpoint trust-set policy, and RPC status.
+- [ ] **Slashing and Evidence:** Add double-signing/equivocation evidence records, penalty policy, and tests for replay/duplicate evidence handling.
+- [ ] **Genesis Ceremony Path:** Separate dev-only deterministic genesis keys from production genesis inputs, ceremony manifests, checksums, and validator attestation files.
+- [ ] **Persistence and Recovery:** Extend state snapshots, indexer records, and startup coherence checks to cover validator registry data.
+
+---
+
+## 38. Phase 36: Real Multi-Node Devnet & Sync Orchestration (Expansion V30)
+
+Prove the implemented runtime pieces work together over real libp2p swarms, real RPC, persistence, restarts, and generated per-node configuration.
+
+### Task List
+
+- [ ] **Daemon Sync Publishing:** Wire outbound `SnapshotChunkRequest` publication from scheduler decisions and peer selection into gossipsub.
+- [ ] **Chunk Serve Path:** On accepted sync requests, call `serve_chunk_request(...)`, encode `SnapshotChunkResponse`, and publish it to the sync chunk topic with reputation-aware serve limits.
+- [ ] **Real-Swarm E2E Tests:** Start multiple local swarms, submit transactions, produce blocks, force one node behind, sync it forward, and verify converged height/state root/index queries.
+- [ ] **Devnet Config Generator:** Generate per-node `node.toml` files with unique state directories, RPC ports, producer keys, bootstrap multiaddrs, and stable P2P listen addresses.
+- [ ] **Docker Compose Hardening:** Use generated configs, bind RPC to `0.0.0.0` inside containers, align exposed P2P ports with daemon listen ports, and persist state volumes.
+- [ ] **Operator Smoke Command:** Add one command/script that builds, launches, health-checks, and tears down a three-node devnet.
+- [ ] **Restart Drill:** Add an automated test that restarts one devnet node and verifies state, mempool, sync checkpoint, finalized checkpoint, and index recovery.
+
+---
+
+## 39. Phase 37: RPC, Wallet & Indexer Productization (Expansion V31)
+
+Turn the API and wallet into a documented, testable surface for users and external tooling.
+
+### Task List
+
+- [ ] **RPC Reference:** Document every JSON-RPC and WebSocket method with request/response examples, null behavior, error codes, and rate-limit behavior.
+- [ ] **Wallet RPC Submission:** Add `homa-cli tx send --rpc-url <URL>` using `homa_sendRawTransaction`; keep direct gossipsub broadcast as an advanced fallback.
+- [ ] **Query Expansion:** Add RPC methods for address timeline, transaction by sender/nonce, block ranges, node version/build info, and index retention diagnostics.
+- [ ] **HTTP/WS Integration Tests:** Start an actual bound RPC server in tests and validate JSON-RPC calls, WebSocket subscribe/unsubscribe, request body limits, and rate limits.
+- [ ] **API Versioning:** Define compatibility rules for method names, response fields, and future breaking changes.
+- [ ] **Indexer Coverage:** Add end-to-end finalized transaction lookup tests through RPC after block production and restart.
+
+---
+
+## 40. Phase 38: Production Operations & Observability (Expansion V32)
+
+Prepare node operation for real operators rather than only developer-run smoke tests.
+
+### Task List
+
+- [ ] **Metrics Export:** Add Prometheus/OpenTelemetry-compatible export for runtime stats, observability counters, sync lag, peer reputation, RPC limits, persistence errors, and finality state.
+- [ ] **Alert Rules:** Define alerts for stalled finality, sync lag, slot misses, block rejection spikes, peer ban spikes, checkpoint corruption, index mismatch, and RPC saturation.
+- [ ] **Runbook Drill Validation:** Exercise bootstrap, restart, recovery, backup/restore, incident triage, and key rotation runbooks, then add expected outputs, owners, and rollback criteria.
+- [ ] **Deployment Templates:** Harden systemd, Docker, and future Kubernetes templates with health checks, config directories, state volumes, user permissions, and log rotation.
+- [ ] **Secret Handling:** Document and implement validator key loading from secure files/env/secrets rather than long-lived plaintext CLI flags.
+- [ ] **Backup Drill Automation:** Add a script/test that backs up a node state directory, restores it into a clean directory, and verifies RPC/indexer recovery.
+
+---
+
+## 41. Phase 39: Security Review & Release Readiness (Expansion V33)
+
+Close the gap from pre-alpha to beta/mainnet candidate.
+
+### Task List
+
+- [ ] **Threat Model:** Write a formal threat model for consensus, networking, wallet, RPC, persistence, deployment, and supply chain.
+- [ ] **External Audit Prep:** Produce audit-ready design docs, invariants, protocol diagrams, and test-evidence bundles.
+- [ ] **Long Fuzz/Soak Jobs:** Add scheduled CI jobs for longer fuzz runs, corpus minimization, coverage reporting, multi-seed chaos soaks, and restart/load soaks.
+- [ ] **Protocol Invariants:** Add property tests for supply conservation, finality monotonicity, validator-set activation, snapshot import safety, and index replay determinism.
+- [ ] **Release Artifacts:** Add reproducible build scripts, checksums, signatures, SBOM output, changelog policy, and binary/container release workflow.
+- [ ] **Advisory Policy:** Resolve or explicitly track remaining ignored/yanked transitive advisories with owners, upstream status, and acceptance criteria.
