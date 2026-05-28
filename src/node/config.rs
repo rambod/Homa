@@ -20,6 +20,8 @@ const DEFAULT_RPC_LISTEN_ADDR: &str = "127.0.0.1:8545";
 const DEFAULT_RPC_MAX_BODY_BYTES: usize = 256 * 1024;
 const DEFAULT_RPC_RATE_LIMIT_PER_SEC: u32 = 100;
 const DEFAULT_WS_MAX_SUBSCRIPTIONS_PER_CONN: usize = 32;
+const DEFAULT_SYNC_ADVERTISEMENT_INTERVAL_MS: u64 = 5_000;
+const DEFAULT_SNAPSHOT_SERVE_CACHE_ENTRIES: usize = 4;
 
 /// Typed network selector for node configuration files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -57,6 +59,8 @@ pub struct NodeRuntimeConfig {
     pub seed_domain: String,
     /// Fallback bootstrap entries (`IP`, `IP:PORT`, or full multiaddr).
     pub fallback_bootstrap: Vec<String>,
+    /// Explicit P2P listen multiaddrs. Empty uses daemon defaults.
+    pub listen_multiaddrs: Vec<String>,
     /// Whether the daemon opens listen sockets.
     pub listen: bool,
     /// Whether the daemon resolves and dials bootstrap peers.
@@ -91,6 +95,10 @@ pub struct NodeRuntimeConfig {
     pub repair_index: bool,
     /// Skips mempool checkpoint ingestion during startup.
     pub ignore_mempool_checkpoint: bool,
+    /// Interval for advertising finalized snapshot metadata to peers.
+    pub sync_advertisement_interval_ms: u64,
+    /// Number of recent finalized snapshots retained for serving peers.
+    pub snapshot_serve_cache_entries: usize,
     /// Optional bounded run-step count for smoke testing.
     pub max_steps: Option<usize>,
     /// Optional persistence directory used for graceful shutdown checkpointing.
@@ -105,6 +113,7 @@ impl Default for NodeRuntimeConfig {
             network: NodeConfigNetwork::default(),
             seed_domain: DEFAULT_SEED_DOMAIN.to_owned(),
             fallback_bootstrap: Vec::new(),
+            listen_multiaddrs: Vec::new(),
             listen: true,
             bootstrap: true,
             strict_bootstrap: false,
@@ -122,6 +131,8 @@ impl Default for NodeRuntimeConfig {
             strict_recovery: true,
             repair_index: false,
             ignore_mempool_checkpoint: false,
+            sync_advertisement_interval_ms: DEFAULT_SYNC_ADVERTISEMENT_INTERVAL_MS,
+            snapshot_serve_cache_entries: DEFAULT_SNAPSHOT_SERVE_CACHE_ENTRIES,
             max_steps: None,
             state_directory: None,
             producer_secret_key_hex: None,
@@ -139,6 +150,8 @@ pub struct NodeRuntimeOverrides {
     pub seed_domain: Option<String>,
     /// Optional fallback bootstrap replacement set.
     pub fallback_bootstrap: Option<Vec<String>>,
+    /// Optional explicit listen multiaddr replacement set.
+    pub listen_multiaddrs: Option<Vec<String>>,
     /// Disable listen sockets.
     pub no_listen: bool,
     /// Disable bootstrap dialing.
@@ -173,6 +186,10 @@ pub struct NodeRuntimeOverrides {
     pub repair_index: Option<bool>,
     /// Optional mempool-checkpoint recovery toggle override.
     pub ignore_mempool_checkpoint: Option<bool>,
+    /// Optional sync advertisement interval override.
+    pub sync_advertisement_interval_ms: Option<u64>,
+    /// Optional snapshot serve cache entry-count override.
+    pub snapshot_serve_cache_entries: Option<usize>,
     /// Optional bounded step count override.
     pub max_steps: Option<usize>,
     /// Optional persistence directory override.
@@ -204,6 +221,9 @@ impl NodeRuntimeConfig {
         }
         if let Some(fallback_bootstrap) = &overrides.fallback_bootstrap {
             self.fallback_bootstrap.clone_from(fallback_bootstrap);
+        }
+        if let Some(listen_multiaddrs) = &overrides.listen_multiaddrs {
+            self.listen_multiaddrs.clone_from(listen_multiaddrs);
         }
         if overrides.no_listen {
             self.listen = false;
@@ -255,6 +275,12 @@ impl NodeRuntimeConfig {
         }
         if let Some(ignore_mempool_checkpoint) = overrides.ignore_mempool_checkpoint {
             self.ignore_mempool_checkpoint = ignore_mempool_checkpoint;
+        }
+        if let Some(sync_advertisement_interval_ms) = overrides.sync_advertisement_interval_ms {
+            self.sync_advertisement_interval_ms = sync_advertisement_interval_ms;
+        }
+        if let Some(snapshot_serve_cache_entries) = overrides.snapshot_serve_cache_entries {
+            self.snapshot_serve_cache_entries = snapshot_serve_cache_entries;
         }
         if let Some(max_steps) = overrides.max_steps {
             self.max_steps = Some(max_steps);
@@ -320,10 +346,29 @@ impl NodeRuntimeConfig {
                 ws_max_subscriptions_per_conn: self.ws_max_subscriptions_per_conn,
             });
         }
+        if self.sync_advertisement_interval_ms == 0 {
+            return Err(NodeConfigError::InvalidSyncAdvertisementIntervalMs {
+                sync_advertisement_interval_ms: self.sync_advertisement_interval_ms,
+            });
+        }
+        if self.snapshot_serve_cache_entries == 0 {
+            return Err(NodeConfigError::InvalidSnapshotServeCacheEntries {
+                snapshot_serve_cache_entries: self.snapshot_serve_cache_entries,
+            });
+        }
         if self.rpc_listen_addr.parse::<SocketAddr>().is_err() {
             return Err(NodeConfigError::InvalidRpcListenAddr {
                 rpc_listen_addr: self.rpc_listen_addr.clone(),
             });
+        }
+        for listen_multiaddr in &self.listen_multiaddrs {
+            if listen_multiaddr.trim().is_empty()
+                || listen_multiaddr.parse::<libp2p::Multiaddr>().is_err()
+            {
+                return Err(NodeConfigError::InvalidListenMultiaddr {
+                    listen_multiaddr: listen_multiaddr.clone(),
+                });
+            }
         }
         if self.min_pow_bits > MAX_POW_BITS {
             return Err(NodeConfigError::InvalidMinPowBits {
@@ -455,6 +500,24 @@ pub enum NodeConfigError {
         /// Configured value.
         ws_max_subscriptions_per_conn: usize,
     },
+    /// Sync advertisement interval must be non-zero.
+    #[error("invalid node config: sync_advertisement_interval_ms must be > 0")]
+    InvalidSyncAdvertisementIntervalMs {
+        /// Configured value.
+        sync_advertisement_interval_ms: u64,
+    },
+    /// Snapshot serve cache must retain at least one snapshot.
+    #[error("invalid node config: snapshot_serve_cache_entries must be > 0")]
+    InvalidSnapshotServeCacheEntries {
+        /// Configured value.
+        snapshot_serve_cache_entries: usize,
+    },
+    /// P2P listen multiaddr is malformed.
+    #[error("invalid node config: listen_multiaddrs entry must be a valid multiaddr")]
+    InvalidListenMultiaddr {
+        /// Configured value.
+        listen_multiaddr: String,
+    },
     /// Minimum `PoW` bits must fit algorithm bounds.
     #[error(
         "invalid node config: min_pow_bits={min_pow_bits} exceeds supported maximum {max_pow_bits}"
@@ -516,6 +579,7 @@ mod tests {
 network = "devnet"
 seed_domain = "seed.devnet.homa"
 fallback_bootstrap = ["127.0.0.1:7000"]
+listen_multiaddrs = ["/ip4/127.0.0.1/tcp/7000"]
 listen = true
 bootstrap = true
 strict_bootstrap = false
@@ -533,6 +597,8 @@ ws_max_subscriptions_per_conn = 64
 strict_recovery = false
 repair_index = true
 ignore_mempool_checkpoint = true
+sync_advertisement_interval_ms = 2500
+snapshot_serve_cache_entries = 6
 max_steps = 5
 state_directory = "state/devnet"
 "#;
@@ -548,6 +614,10 @@ state_directory = "state/devnet"
             "loaded config should pass validation"
         );
         assert_eq!(loaded.seed_domain, "seed.devnet.homa");
+        assert_eq!(
+            loaded.listen_multiaddrs,
+            vec!["/ip4/127.0.0.1/tcp/7000".to_owned()]
+        );
         assert_eq!(loaded.slot_duration_ms, 1000);
         assert_eq!(loaded.max_block_transactions, 512);
         assert_eq!(loaded.mempool_checkpoint_interval_ms, 2000);
@@ -559,6 +629,8 @@ state_directory = "state/devnet"
         assert!(!loaded.strict_recovery);
         assert!(loaded.repair_index);
         assert!(loaded.ignore_mempool_checkpoint);
+        assert_eq!(loaded.sync_advertisement_interval_ms, 2_500);
+        assert_eq!(loaded.snapshot_serve_cache_entries, 6);
         assert_eq!(loaded.max_steps, Some(5));
 
         let cleanup = fs::remove_file(path);
@@ -626,6 +698,7 @@ state_directory = "state/devnet"
             no_listen: true,
             no_bootstrap: true,
             strict_bootstrap: true,
+            listen_multiaddrs: Some(vec!["/ip4/127.0.0.1/tcp/7000".to_owned()]),
             event_loop_tick_ms: Some(999),
             slot_duration_ms: Some(777),
             max_block_transactions: Some(33),
@@ -639,6 +712,8 @@ state_directory = "state/devnet"
             strict_recovery: Some(false),
             repair_index: Some(true),
             ignore_mempool_checkpoint: Some(true),
+            sync_advertisement_interval_ms: Some(2_500),
+            snapshot_serve_cache_entries: Some(8),
             max_steps: Some(2),
             ..NodeRuntimeOverrides::default()
         };
@@ -654,6 +729,10 @@ state_directory = "state/devnet"
             config.strict_bootstrap,
             "strict bootstrap should be enabled by override"
         );
+        assert_eq!(
+            config.listen_multiaddrs,
+            vec!["/ip4/127.0.0.1/tcp/7000".to_owned()]
+        );
         assert_eq!(config.event_loop_tick_ms, 999);
         assert_eq!(config.slot_duration_ms, 777);
         assert_eq!(config.max_block_transactions, 33);
@@ -667,6 +746,8 @@ state_directory = "state/devnet"
         assert!(!config.strict_recovery);
         assert!(config.repair_index);
         assert!(config.ignore_mempool_checkpoint);
+        assert_eq!(config.sync_advertisement_interval_ms, 2_500);
+        assert_eq!(config.snapshot_serve_cache_entries, 8);
         assert_eq!(config.max_steps, Some(2));
     }
 

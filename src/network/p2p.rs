@@ -21,7 +21,7 @@ use libp2p::{Multiaddr, PeerId, StreamProtocol, SwarmBuilder, noise, tcp, yamux}
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::core::block::MAX_BLOCK_BYTES;
+use crate::core::block::{Block, MAX_BLOCK_BYTES};
 use crate::core::sync::SnapshotChunk;
 use crate::core::transaction::{
     BorrowedTransaction, MAX_TRANSACTION_BYTES, Transaction, TransactionError,
@@ -36,6 +36,8 @@ pub const BLOCKS_TOPIC: &str = "blocks";
 pub const SYNC_REQUESTS_TOPIC: &str = "sync-requests";
 /// Gossipsub topic for snapshot chunk responses.
 pub const SYNC_CHUNKS_TOPIC: &str = "sync-chunks";
+/// Gossipsub topic for finalized snapshot advertisements.
+pub const SYNC_ADVERTISEMENTS_TOPIC: &str = "sync-advertisements";
 /// Gossipsub topic for checkpoint trust-set rotation updates.
 pub const CHECKPOINT_ROTATIONS_TOPIC: &str = "checkpoint-rotations";
 /// Upper bound for inbound block gossip payload size in bytes.
@@ -216,10 +218,14 @@ pub struct BroadcastReport {
 }
 
 /// Request envelope for one snapshot chunk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotChunkRequest {
     /// Caller-provided request correlation id.
     pub request_id: u64,
+    /// Peer id that requested the chunk.
+    pub requester_peer_id: String,
+    /// Peer id expected to serve the chunk.
+    pub target_peer_id: String,
     /// Snapshot block height being requested.
     pub block_height: u64,
     /// Snapshot state root being requested.
@@ -237,13 +243,34 @@ pub struct SnapshotChunkRequest {
 pub struct SnapshotChunkResponse {
     /// Request correlation id copied from [`SnapshotChunkRequest`].
     pub request_id: u64,
+    /// Peer id that originally requested this chunk.
+    pub requester_peer_id: String,
+    /// Peer id that served this response.
+    pub responder_peer_id: String,
     /// Returned chunk payload.
     pub chunk: SnapshotChunk,
 }
 
-/// Typed sync wire message used over request/chunk sync topics.
+/// Finalized snapshot metadata advertisement used to start peer catch-up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotAdvertisement {
+    /// Finalized block that anchors the advertised state root.
+    pub finalized_block: Block,
+    /// Hash of the full serialized snapshot payload.
+    pub snapshot_hash: [u8; 32],
+    /// Total chunk count available for this snapshot.
+    pub total_chunks: u32,
+    /// Maximum chunk payload bytes used to split this snapshot.
+    pub chunk_bytes: usize,
+    /// Sender wall-clock timestamp in unix milliseconds.
+    pub advertised_at_unix_ms: u64,
+}
+
+/// Typed sync wire message used over sync topics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SyncWireMessage {
+    /// Advertisement for one finalized state snapshot.
+    SnapshotAdvertisement(SnapshotAdvertisement),
     /// Request one chunk for a known snapshot root.
     SnapshotChunkRequest(SnapshotChunkRequest),
     /// Response with one snapshot chunk payload.
@@ -253,6 +280,7 @@ pub enum SyncWireMessage {
 impl SyncWireMessage {
     const fn kind_name(&self) -> &'static str {
         match self {
+            Self::SnapshotAdvertisement(_) => "snapshot_advertisement",
             Self::SnapshotChunkRequest(_) => "snapshot_chunk_request",
             Self::SnapshotChunkResponse(_) => "snapshot_chunk_response",
         }
@@ -295,6 +323,9 @@ pub fn build_swarm(config: P2PConfig) -> Result<Swarm<HomaBehaviour>, NetworkErr
                 .map_err(|_| NetworkError::TopicSubscription)?;
             gossipsub
                 .subscribe(&IdentTopic::new(SYNC_CHUNKS_TOPIC))
+                .map_err(|_| NetworkError::TopicSubscription)?;
+            gossipsub
+                .subscribe(&IdentTopic::new(SYNC_ADVERTISEMENTS_TOPIC))
                 .map_err(|_| NetworkError::TopicSubscription)?;
             gossipsub
                 .subscribe(&IdentTopic::new(CHECKPOINT_ROTATIONS_TOPIC))
@@ -341,6 +372,12 @@ pub fn sync_requests_topic() -> IdentTopic {
 #[must_use]
 pub fn sync_chunks_topic() -> IdentTopic {
     IdentTopic::new(SYNC_CHUNKS_TOPIC)
+}
+
+/// Returns canonical topic descriptor for snapshot advertisements.
+#[must_use]
+pub fn sync_advertisements_topic() -> IdentTopic {
+    IdentTopic::new(SYNC_ADVERTISEMENTS_TOPIC)
 }
 
 /// Returns canonical topic descriptor for checkpoint trust-set rotations.
@@ -438,10 +475,12 @@ pub fn decode_snapshot_chunk_request(payload: &[u8]) -> Result<SnapshotChunkRequ
     let actual = message.kind_name();
     match message {
         SyncWireMessage::SnapshotChunkRequest(request) => Ok(request),
-        SyncWireMessage::SnapshotChunkResponse(_) => Err(NetworkError::UnexpectedSyncMessageKind {
-            expected: "snapshot_chunk_request",
-            actual,
-        }),
+        SyncWireMessage::SnapshotAdvertisement(_) | SyncWireMessage::SnapshotChunkResponse(_) => {
+            Err(NetworkError::UnexpectedSyncMessageKind {
+                expected: "snapshot_chunk_request",
+                actual,
+            })
+        }
     }
 }
 
@@ -460,10 +499,36 @@ pub fn decode_snapshot_chunk_response(
     let actual = message.kind_name();
     match message {
         SyncWireMessage::SnapshotChunkResponse(response) => Ok(response),
-        SyncWireMessage::SnapshotChunkRequest(_) => Err(NetworkError::UnexpectedSyncMessageKind {
-            expected: "snapshot_chunk_response",
-            actual,
-        }),
+        SyncWireMessage::SnapshotAdvertisement(_) | SyncWireMessage::SnapshotChunkRequest(_) => {
+            Err(NetworkError::UnexpectedSyncMessageKind {
+                expected: "snapshot_chunk_response",
+                actual,
+            })
+        }
+    }
+}
+
+/// Encodes a snapshot advertisement into sync wire bytes.
+pub fn encode_snapshot_advertisement(
+    advertisement: SnapshotAdvertisement,
+) -> Result<Vec<u8>, NetworkError> {
+    encode_sync_wire_message(&SyncWireMessage::SnapshotAdvertisement(advertisement))
+}
+
+/// Decodes and extracts a snapshot advertisement from sync wire bytes.
+pub fn decode_snapshot_advertisement(
+    payload: &[u8],
+) -> Result<SnapshotAdvertisement, NetworkError> {
+    let message = decode_sync_wire_message(payload)?;
+    let actual = message.kind_name();
+    match message {
+        SyncWireMessage::SnapshotAdvertisement(advertisement) => Ok(advertisement),
+        SyncWireMessage::SnapshotChunkRequest(_) | SyncWireMessage::SnapshotChunkResponse(_) => {
+            Err(NetworkError::UnexpectedSyncMessageKind {
+                expected: "snapshot_advertisement",
+                actual,
+            })
+        }
     }
 }
 
@@ -791,16 +856,18 @@ fn split_peer_id(mut address: Multiaddr) -> Result<(PeerId, Multiaddr), NetworkE
 mod tests {
     use super::{
         DEFAULT_BOOTSTRAP_QUIC_PORT, DEFAULT_BOOTSTRAP_TCP_PORT, MAX_BLOCK_GOSSIP_BYTES,
-        MAX_SYNC_WIRE_MESSAGE_BYTES, NetworkError, P2PConfig, SnapshotChunkRequest,
-        SnapshotChunkResponse, add_kademlia_address, blocks_topic,
+        MAX_SYNC_WIRE_MESSAGE_BYTES, NetworkError, P2PConfig, SnapshotAdvertisement,
+        SnapshotChunkRequest, SnapshotChunkResponse, add_kademlia_address, blocks_topic,
         broadcast_transaction_bytes_with_observability, build_swarm, checkpoint_rotations_topic,
-        decode_snapshot_chunk_request, decode_snapshot_chunk_response, decode_sync_wire_message,
+        decode_snapshot_advertisement, decode_snapshot_chunk_request,
+        decode_snapshot_chunk_response, decode_sync_wire_message,
         decode_transaction_gossip_payload, decode_transaction_gossip_payload_zero_copy,
-        dedupe_multiaddrs, encode_snapshot_chunk_request, encode_snapshot_chunk_response,
-        ip_to_default_multiaddrs, resolve_bootstrap_addresses, split_txt_payload,
-        sync_chunks_topic, sync_requests_topic, tokens_to_multiaddrs, transactions_topic,
-        validate_block_gossip_payload_bounds,
+        dedupe_multiaddrs, encode_snapshot_advertisement, encode_snapshot_chunk_request,
+        encode_snapshot_chunk_response, ip_to_default_multiaddrs, resolve_bootstrap_addresses,
+        split_txt_payload, sync_advertisements_topic, sync_chunks_topic, sync_requests_topic,
+        tokens_to_multiaddrs, transactions_topic, validate_block_gossip_payload_bounds,
     };
+    use crate::core::block::{Block, BlockHeader};
     use crate::core::state::AccountState;
     use crate::core::sync::{SnapshotAccount, StateSnapshot, split_snapshot_into_chunks};
     use crate::core::transaction::Transaction;
@@ -889,6 +956,10 @@ mod tests {
         assert_eq!(sync_requests_topic().to_string(), "sync-requests");
         assert_eq!(sync_chunks_topic().to_string(), "sync-chunks");
         assert_eq!(
+            sync_advertisements_topic().to_string(),
+            "sync-advertisements"
+        );
+        assert_eq!(
             checkpoint_rotations_topic().to_string(),
             "checkpoint-rotations"
         );
@@ -898,13 +969,15 @@ mod tests {
     fn snapshot_chunk_request_roundtrip_over_sync_wire() {
         let request = SnapshotChunkRequest {
             request_id: 7,
+            requester_peer_id: "peer-requester".to_owned(),
+            target_peer_id: "peer-target".to_owned(),
             block_height: 44,
             state_root: [3_u8; 32],
             snapshot_hash: [9_u8; 32],
             chunk_index: 1,
             total_chunks: 5,
         };
-        let encoded = encode_snapshot_chunk_request(request);
+        let encoded = encode_snapshot_chunk_request(request.clone());
         assert!(encoded.is_ok(), "sync request encode should succeed");
 
         let decoded = decode_snapshot_chunk_request(&encoded.unwrap_or_else(|_| unreachable!()));
@@ -920,6 +993,8 @@ mod tests {
     fn snapshot_chunk_response_roundtrip_over_sync_wire() {
         let response = SnapshotChunkResponse {
             request_id: 22,
+            requester_peer_id: "peer-requester".to_owned(),
+            responder_peer_id: "peer-target".to_owned(),
             chunk: sample_sync_chunk(),
         };
         let encoded = encode_snapshot_chunk_response(response.clone());
@@ -935,9 +1010,34 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_advertisement_roundtrip_over_sync_wire() {
+        let finalized_block = Block {
+            header: BlockHeader::new(11, [1_u8; 32], [2_u8; 32], 123, "HMA_PROP".to_owned()),
+            transactions: Vec::new(),
+            proposer_signature: vec![3_u8; 64],
+            proposer_public_key: vec![4_u8; 32],
+        };
+        let advertisement = SnapshotAdvertisement {
+            finalized_block,
+            snapshot_hash: [9_u8; 32],
+            total_chunks: 3,
+            chunk_bytes: 65_536,
+            advertised_at_unix_ms: 999,
+        };
+        let encoded = encode_snapshot_advertisement(advertisement.clone());
+        assert!(encoded.is_ok(), "advertisement encode should succeed");
+
+        let decoded = decode_snapshot_advertisement(&encoded.unwrap_or_else(|_| unreachable!()));
+        assert!(decoded.is_ok(), "advertisement decode should succeed");
+        assert_eq!(decoded.unwrap_or_else(|_| unreachable!()), advertisement);
+    }
+
+    #[test]
     fn snapshot_chunk_decode_rejects_wrong_sync_variant() {
         let request = SnapshotChunkRequest {
             request_id: 99,
+            requester_peer_id: "peer-requester".to_owned(),
+            target_peer_id: "peer-target".to_owned(),
             block_height: 50,
             state_root: [4_u8; 32],
             snapshot_hash: [6_u8; 32],

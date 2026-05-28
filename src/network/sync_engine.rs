@@ -960,7 +960,7 @@ impl ChunkRequestScheduler {
         };
         Ok(PendingRequestCheckpoint {
             peer_id: pending.peer_id.clone(),
-            request: pending.request,
+            request: pending.request.clone(),
             attempt: pending.attempt,
             deadline_ms: pending.deadline_ms,
         })
@@ -989,7 +989,7 @@ impl ChunkRequestScheduler {
                 pending.deadline_ms = now_ms.saturating_add(self.policy.request_timeout_ms);
                 outcome.retries.push(RetryDispatch {
                     peer_id: pending.peer_id.clone(),
-                    request: pending.request,
+                    request: pending.request.clone(),
                     attempt: pending.attempt,
                 });
                 continue;
@@ -1039,7 +1039,7 @@ impl ChunkRequestScheduler {
                     *request_id,
                     PendingRequestCheckpoint {
                         peer_id: pending.peer_id.clone(),
-                        request: pending.request,
+                        request: pending.request.clone(),
                         attempt: pending.attempt,
                         deadline_ms: pending.deadline_ms,
                     },
@@ -1581,6 +1581,8 @@ pub fn serve_chunk_request(
 
     Ok(SnapshotChunkResponse {
         request_id: request.request_id,
+        requester_peer_id: request.requester_peer_id,
+        responder_peer_id: peer_id.to_owned(),
         chunk: chunk.clone(),
     })
 }
@@ -1618,8 +1620,7 @@ mod tests {
         fn new() -> Self {
             let now_nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map(|value| value.as_nanos())
-                .unwrap_or(0);
+                .map_or(0, |value| value.as_nanos());
             let unique_id = TEST_DIRECTORY_COUNTER.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
                 "homa-sync-session-test-{}-{now_nanos}-{unique_id}",
@@ -1684,6 +1685,8 @@ mod tests {
         let first = &chunks[0];
         let request = SnapshotChunkRequest {
             request_id: 1,
+            requester_peer_id: "peer-requester".to_owned(),
+            target_peer_id: "peer-target".to_owned(),
             block_height: first.block_height,
             state_root: first.state_root,
             snapshot_hash: first.snapshot_hash,
@@ -1724,6 +1727,8 @@ mod tests {
         let chunk = &chunks[0];
         let request_one = SnapshotChunkRequest {
             request_id: 7,
+            requester_peer_id: "peer-requester".to_owned(),
+            target_peer_id: "peer-target".to_owned(),
             block_height: chunk.block_height,
             state_root: chunk.state_root,
             snapshot_hash: chunk.snapshot_hash,
@@ -1732,6 +1737,8 @@ mod tests {
         };
         let request_two = SnapshotChunkRequest {
             request_id: 8,
+            requester_peer_id: "peer-requester".to_owned(),
+            target_peer_id: "peer-target".to_owned(),
             ..request_one
         };
 
@@ -1740,7 +1747,7 @@ mod tests {
                 .schedule("peer-a".to_owned(), request_one, 1_000)
                 .is_ok()
         );
-        let denied = scheduler.schedule("peer-b".to_owned(), request_two, 1_000);
+        let denied = scheduler.schedule("peer-b".to_owned(), request_two.clone(), 1_000);
         assert!(
             matches!(
                 denied,
@@ -1769,6 +1776,8 @@ mod tests {
         let chunks = sample_chunks();
         let request = SnapshotChunkRequest {
             request_id: 99,
+            requester_peer_id: "peer-requester".to_owned(),
+            target_peer_id: "peer-target".to_owned(),
             block_height: chunks[0].block_height,
             state_root: chunks[0].state_root,
             snapshot_hash: chunks[0].snapshot_hash,
@@ -2124,6 +2133,8 @@ mod tests {
         let requested = &chunks[0];
         let request = SnapshotChunkRequest {
             request_id: 19,
+            requester_peer_id: "peer-requester".to_owned(),
+            target_peer_id: "peer-target".to_owned(),
             block_height: requested.block_height,
             state_root: requested.state_root,
             snapshot_hash: requested.snapshot_hash,
@@ -2147,6 +2158,8 @@ mod tests {
         let requested = &chunks[0];
         let request = SnapshotChunkRequest {
             request_id: 21,
+            requester_peer_id: "peer-requester".to_owned(),
+            target_peer_id: "peer-target".to_owned(),
             block_height: requested.block_height.saturating_add(1),
             state_root: requested.state_root,
             snapshot_hash: requested.snapshot_hash,
@@ -2174,6 +2187,8 @@ mod tests {
         let chunks = sample_chunks();
         let request = SnapshotChunkRequest {
             request_id: 777,
+            requester_peer_id: "peer-requester".to_owned(),
+            target_peer_id: "peer-target".to_owned(),
             block_height: chunks[0].block_height,
             state_root: chunks[0].state_root,
             snapshot_hash: chunks[0].snapshot_hash,
@@ -2311,6 +2326,8 @@ mod tests {
         let chunks = sample_chunks();
         let request = SnapshotChunkRequest {
             request_id: 41,
+            requester_peer_id: "peer-requester".to_owned(),
+            target_peer_id: "peer-target".to_owned(),
             block_height: chunks[0].block_height,
             state_root: chunks[0].state_root,
             snapshot_hash: chunks[0].snapshot_hash,

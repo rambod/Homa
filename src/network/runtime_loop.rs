@@ -7,10 +7,11 @@ use crate::network::checkpoint_rotation::{
     CheckpointRotationError, CheckpointSetRotationUpdate, RotationIngestOutcome,
 };
 use crate::network::p2p::{
-    BLOCKS_TOPIC, CHECKPOINT_ROTATIONS_TOPIC, NetworkError, SYNC_CHUNKS_TOPIC, SYNC_REQUESTS_TOPIC,
-    SnapshotChunkRequest, SnapshotChunkResponse, TRANSACTIONS_TOPIC, decode_snapshot_chunk_request,
-    decode_snapshot_chunk_response, decode_transaction_gossip_payload,
-    validate_block_gossip_payload_bounds,
+    BLOCKS_TOPIC, CHECKPOINT_ROTATIONS_TOPIC, NetworkError, SYNC_ADVERTISEMENTS_TOPIC,
+    SYNC_CHUNKS_TOPIC, SYNC_REQUESTS_TOPIC, SnapshotAdvertisement, SnapshotChunkRequest,
+    SnapshotChunkResponse, TRANSACTIONS_TOPIC, decode_snapshot_advertisement,
+    decode_snapshot_chunk_request, decode_snapshot_chunk_response,
+    decode_transaction_gossip_payload, validate_block_gossip_payload_bounds,
 };
 use crate::network::reputation::ReputationEvent;
 use crate::network::runtime_policy::{RuntimePolicyError, SyncRuntimePolicyController};
@@ -28,6 +29,8 @@ pub enum InboundGossipAction {
     SyncChunkRequest(SnapshotChunkRequest),
     /// Decoded snapshot chunk response.
     SyncChunkResponse(SnapshotChunkResponse),
+    /// Decoded finalized snapshot advertisement.
+    SyncAdvertisement(SnapshotAdvertisement),
     /// Checkpoint trust-set rotation update outcome.
     CheckpointRotation {
         /// Rotation ingest decision.
@@ -94,6 +97,11 @@ pub fn handle_inbound_gossip_message(
             let response = decode_snapshot_chunk_response(payload)
                 .map_err(|source| RuntimeLoopError::Network { source })?;
             Ok(InboundGossipAction::SyncChunkResponse(response))
+        }
+        SYNC_ADVERTISEMENTS_TOPIC => {
+            let advertisement = decode_snapshot_advertisement(payload)
+                .map_err(|source| RuntimeLoopError::Network { source })?;
+            Ok(InboundGossipAction::SyncAdvertisement(advertisement))
         }
         CHECKPOINT_ROTATIONS_TOPIC => handle_checkpoint_rotation_topic(controller, payload),
         _ => Err(RuntimeLoopError::UnknownTopic {
@@ -267,6 +275,8 @@ mod tests {
     fn sample_encoded_request(request_id: u64) -> Vec<u8> {
         let payload = encode_snapshot_chunk_request(crate::network::p2p::SnapshotChunkRequest {
             request_id,
+            requester_peer_id: "peer-requester".to_owned(),
+            target_peer_id: "peer-target".to_owned(),
             block_height: 10,
             state_root: [1_u8; 32],
             snapshot_hash: [2_u8; 32],
@@ -329,6 +339,8 @@ mod tests {
 
         let request = crate::network::p2p::SnapshotChunkRequest {
             request_id,
+            requester_peer_id: "peer-requester".to_owned(),
+            target_peer_id: "peer-sync".to_owned(),
             block_height: chunk.block_height,
             state_root: chunk.state_root,
             snapshot_hash: chunk.snapshot_hash,
@@ -337,6 +349,8 @@ mod tests {
         };
         let encoded = encode_snapshot_chunk_response(crate::network::p2p::SnapshotChunkResponse {
             request_id,
+            requester_peer_id: "peer-requester".to_owned(),
+            responder_peer_id: "peer-sync".to_owned(),
             chunk,
         });
         assert!(encoded.is_ok(), "chunk response encoding should succeed");
@@ -395,6 +409,8 @@ mod tests {
                 let request_id = request_id_base + u64::try_from(index).unwrap_or(u64::MAX);
                 let request = crate::network::p2p::SnapshotChunkRequest {
                     request_id,
+                    requester_peer_id: "peer-requester".to_owned(),
+                    target_peer_id: "peer-stream".to_owned(),
                     block_height: chunk.block_height,
                     state_root: chunk.state_root,
                     snapshot_hash: chunk.snapshot_hash,
@@ -404,6 +420,8 @@ mod tests {
                 let encoded =
                     encode_snapshot_chunk_response(crate::network::p2p::SnapshotChunkResponse {
                         request_id,
+                        requester_peer_id: "peer-requester".to_owned(),
+                        responder_peer_id: "peer-stream".to_owned(),
                         chunk,
                     });
                 assert!(encoded.is_ok(), "chunk response encoding should succeed");
@@ -788,7 +806,7 @@ mod tests {
 
         for (_payload, request) in &stream {
             let scheduled =
-                sync_runtime.schedule_outbound_request("peer-stream", 12, *request, 30_000);
+                sync_runtime.schedule_outbound_request("peer-stream", 12, request.clone(), 30_000);
             assert!(scheduled.is_ok(), "all stream requests should schedule");
         }
 

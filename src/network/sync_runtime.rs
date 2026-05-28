@@ -449,30 +449,28 @@ impl SyncRuntimeCoordinator {
             SessionSchedule::Scheduled => {}
         }
 
+        let request_id = request.request_id;
+        let request_chunk_index = request.chunk_index;
         if let Err(source) = self.scheduler.schedule(peer_id.to_owned(), request, now_ms) {
             self.session_manager
-                .acknowledge_chunk(peer_id, session_id, request.chunk_index)
+                .acknowledge_chunk(peer_id, session_id, request_chunk_index)
                 .map_err(|source| SyncRuntimeError::SessionRollback { source })?;
             return Err(SyncRuntimeError::SyncEngine { source });
         }
 
         if self
             .request_sessions
-            .insert(request.request_id, session_id)
+            .insert(request_id, session_id)
             .is_some()
         {
-            let _ = self.scheduler.acknowledge(request.request_id);
+            let _ = self.scheduler.acknowledge(request_id);
             let _ =
                 self.session_manager
-                    .acknowledge_chunk(peer_id, session_id, request.chunk_index);
-            return Err(SyncRuntimeError::RequestAlreadyTracked {
-                request_id: request.request_id,
-            });
+                    .acknowledge_chunk(peer_id, session_id, request_chunk_index);
+            return Err(SyncRuntimeError::RequestAlreadyTracked { request_id });
         }
 
-        Ok(OutboundRequestScheduleOutcome::Scheduled {
-            request_id: request.request_id,
-        })
+        Ok(OutboundRequestScheduleOutcome::Scheduled { request_id })
     }
 
     /// Activates one timeout-retry dispatch when session backoff allows it.
@@ -538,7 +536,7 @@ impl SyncRuntimeCoordinator {
             });
         }
 
-        if let Some(field) = response_metadata_mismatch_field(context.request, &response) {
+        if let Some(field) = response_metadata_mismatch_field(&context.request, &response) {
             return Err(SyncRuntimeError::ResponseMetadataMismatch { request_id, field });
         }
 
@@ -970,11 +968,17 @@ fn record_snapshot_import_observability(
 }
 
 fn response_metadata_mismatch_field(
-    request: SnapshotChunkRequest,
+    request: &SnapshotChunkRequest,
     response: &SnapshotChunkResponse,
 ) -> Option<&'static str> {
     if response.request_id != request.request_id {
         return Some("request_id");
+    }
+    if response.requester_peer_id != request.requester_peer_id {
+        return Some("requester_peer_id");
+    }
+    if response.responder_peer_id != request.target_peer_id {
+        return Some("responder_peer_id");
     }
     if response.chunk.block_height != request.block_height {
         return Some("block_height");
@@ -1085,13 +1089,20 @@ mod tests {
         let chunk = sample_chunk();
         let request = SnapshotChunkRequest {
             request_id,
+            requester_peer_id: "peer-requester".to_owned(),
+            target_peer_id: "peer-target".to_owned(),
             block_height: chunk.block_height,
             state_root: chunk.state_root,
             snapshot_hash: chunk.snapshot_hash,
             chunk_index: chunk.chunk_index,
             total_chunks: chunk.total_chunks,
         };
-        let response = SnapshotChunkResponse { request_id, chunk };
+        let response = SnapshotChunkResponse {
+            request_id,
+            requester_peer_id: "peer-requester".to_owned(),
+            responder_peer_id: "peer-target".to_owned(),
+            chunk,
+        };
         (request, response)
     }
 
@@ -1237,6 +1248,8 @@ mod tests {
             .enumerate()
             .map(|(index, chunk)| SnapshotChunkRequest {
                 request_id: u64::try_from(index).unwrap_or(u64::MAX) + 1_000,
+                requester_peer_id: "peer-requester".to_owned(),
+                target_peer_id: "peer-target".to_owned(),
                 block_height: chunk.block_height,
                 state_root: chunk.state_root,
                 snapshot_hash: chunk.snapshot_hash,
@@ -1249,12 +1262,15 @@ mod tests {
             .zip(chunks.iter())
             .map(|(request, chunk)| SnapshotChunkResponse {
                 request_id: request.request_id,
+                requester_peer_id: "peer-requester".to_owned(),
+                responder_peer_id: "peer-target".to_owned(),
                 chunk: chunk.clone(),
             })
             .collect::<Vec<_>>();
 
         for request in &requests {
-            let scheduled = runtime.schedule_outbound_request("peer-asm", 21, *request, 9_000);
+            let scheduled =
+                runtime.schedule_outbound_request("peer-asm", 21, request.clone(), 9_000);
             assert!(scheduled.is_ok(), "all requests should schedule");
         }
         for response in responses.into_iter().rev() {
@@ -1369,7 +1385,7 @@ mod tests {
         let mut runtime = coordinator(0);
         let (request, _response) = sample_request_and_response(44);
 
-        let scheduled = runtime.schedule_outbound_request("peer-x", 6, request, 4_000);
+        let scheduled = runtime.schedule_outbound_request("peer-x", 6, request.clone(), 4_000);
         assert!(scheduled.is_ok(), "initial request should schedule");
 
         let feedback = runtime.poll_timeout_feedback(4_100);
@@ -1382,7 +1398,8 @@ mod tests {
         assert_eq!(runtime.in_flight_request_count(), 0);
         assert_eq!(runtime.tracked_request_count(), 0);
 
-        let deferred_reschedule = runtime.schedule_outbound_request("peer-x", 6, request, 4_150);
+        let deferred_reschedule =
+            runtime.schedule_outbound_request("peer-x", 6, request.clone(), 4_150);
         assert!(
             matches!(
                 deferred_reschedule,
@@ -1441,6 +1458,8 @@ mod tests {
             .enumerate()
             .map(|(index, chunk)| SnapshotChunkRequest {
                 request_id: u64::try_from(index).unwrap_or(u64::MAX) + 1_000,
+                requester_peer_id: "peer-requester".to_owned(),
+                target_peer_id: "peer-target".to_owned(),
                 block_height: chunk.block_height,
                 state_root: chunk.state_root,
                 snapshot_hash: chunk.snapshot_hash,
@@ -1453,12 +1472,15 @@ mod tests {
             .zip(chunks.iter())
             .map(|(request, chunk)| SnapshotChunkResponse {
                 request_id: request.request_id,
+                requester_peer_id: "peer-requester".to_owned(),
+                responder_peer_id: "peer-target".to_owned(),
                 chunk: chunk.clone(),
             })
             .collect::<Vec<_>>();
 
         for request in &requests {
-            let scheduled = runtime.schedule_outbound_request("peer-asm", 21, *request, 9_000);
+            let scheduled =
+                runtime.schedule_outbound_request("peer-asm", 21, request.clone(), 9_000);
             assert!(scheduled.is_ok(), "all requests should schedule");
         }
 

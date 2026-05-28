@@ -1,6 +1,7 @@
 network = "testnet"
 seed_domain = "seed1.homanetwork.io"
 fallback_bootstrap = []
+listen_multiaddrs = []
 listen = true
 bootstrap = true
 strict_bootstrap = false
@@ -18,6 +19,8 @@ ws_max_subscriptions_per_conn = 32
 strict_recovery = true
 repair_index = false
 ignore_mempool_checkpoint = false
+sync_advertisement_interval_ms = 5000
+snapshot_serve_cache_entries = 4
 # max_steps = 10
 # state_directory = "state/node-1"
 # producer_secret_key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

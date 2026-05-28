@@ -14,22 +14,22 @@ This file is the short current roadmap. `../Homa_Architecture_and_Implementation
 | Ledger state | Implemented: account balances/nonces, max supply cap, fee redistribution, deterministic state root. | `src/core/state.rs` |
 | Blocks | Implemented: block/header model, transaction root, proposer proof validation, bounded decode. | `src/core/block.rs` |
 | Mempool | Implemented: PoW admission, fee/PoW priority, TTL pruning, sender/peer throttles, durable checkpoint recovery. | `src/core/mempool.rs`, `src/core/mempool_checkpoint.rs` |
-| Fast sync primitives | Implemented: snapshots, chunking, checkpoint verification, anti-rollback import, runtime assembly/quarantine. | `src/core/sync.rs`, `src/network/sync_runtime.rs` |
-| P2P boundary | Implemented: libp2p swarm setup, gossipsub topics, Kademlia bootstrap helpers, sync wire codecs. | `src/network/p2p.rs` |
+| Fast sync primitives | Implemented: snapshots, chunking, checkpoint verification, anti-rollback import, runtime assembly/quarantine, P2P advertisement/request/response orchestration. | `src/core/sync.rs`, `src/network/sync_runtime.rs`, `src/node/daemon.rs` |
+| P2P boundary | Implemented: libp2p swarm setup, gossipsub topics, Kademlia bootstrap helpers, targeted sync wire codecs, snapshot advertisements. | `src/network/p2p.rs` |
 | Reputation and runtime policy | Implemented: peer scoring, adaptive serve/dial penalties, checkpoint trust-set rotation. | `src/network/reputation.rs`, `src/network/runtime_policy.rs`, `src/network/checkpoint_rotation.rs` |
 | Node daemon | Implemented: lifecycle states, pending block finalization, local block production, restart recovery, persistence flush, swarm polling. | `src/node/daemon.rs` |
 | RPC/WS | Implemented: JSON-RPC server, request limits, status/block/balance/tx/mempool/peer methods, WS subscriptions. | `src/node/rpc.rs` |
 | Persistent indexer | Implemented: finalized block event log, transaction/block/address indexes, rebuild and retention compaction. | `src/core/indexer.rs` |
 | Wallet CLI | Implemented: encrypted wallet, nonce state, local PoW, signed tx broadcast over gossipsub. | `src/wallet/cli.rs` |
 | Tests and fuzzing | Implemented: unit tests, chaos integration tests, partition chaos fuzzer, three cargo-fuzz targets. | `tests/`, `fuzz/` |
-| Deploy and ops docs | Present: Docker/systemd/logrotate and baseline runbooks exist, but devnet config and operational procedures need production hardening and drill validation. | `deploy/`, `docs/runbooks/` |
+| Deploy and ops docs | Present: Docker/systemd/logrotate, generated devnet configs/scripts, and baseline runbooks exist; production drills and observability export still need hardening. | `deploy/`, `scripts/devnet.sh`, `docs/runbooks/` |
 
 ## Main Gaps
 
 1. **Distributed finality is not complete.** The node can produce, validate, self-finalize, and accept valid inbound blocks, but there is no validator vote/attestation quorum or finality certificate path.
 2. **Validator membership is static.** Stake and trusted-checkpoint sets derive from deterministic genesis/bootstrap state. There is no on-chain staking, unbonding, validator activation, or slashing flow.
-3. **Sync transport needs full end-to-end orchestration.** The wire codec, scheduler, session manager, and inbound response path exist, but the daemon still needs complete request publication, chunk serving, response publication, and integration tests over real swarms.
-4. **Devnet deployment config is not yet reliable.** Current Docker assets reuse one example config, bind RPC to localhost, use random listen ports, and do not generate per-node persistence, producer keys, or bootstrap peer addresses.
+3. **Devnet needs extended end-to-end validation.** Per-node generation, stable P2P ports, snapshot advertisements, request publication, chunk serving, and response import are implemented; the remaining work is a stronger multi-process transaction/restart/catch-up test.
+4. **Deployment config is still pre-production.** Devnet Docker/local tooling exists, but secrets, metrics, alerting, backup drills, and release artifacts still need production hardening.
 5. **Observability is in-process only.** Counters/events exist, but there is no Prometheus/OpenTelemetry endpoint, alert set, dashboard, or production log schema.
 6. **Operator procedures need drill validation.** Runbooks now include baseline commands and checks, but production needs exercised rollback criteria, ownership, and failure-mode decision trees.
 7. **Security release posture is incomplete.** Release gates exist, but mainnet needs a threat model, external review, longer fuzz/soak runs, reproducible artifacts, genesis ceremony, and key-management policy.
@@ -46,11 +46,13 @@ This file is the short current roadmap. `../Homa_Architecture_and_Implementation
 
 ### P0: Real Multi-Node Devnet
 
-- [ ] Add per-node devnet config generation with unique state directories, producer keys, RPC ports, and bootstrap multiaddrs.
-- [ ] Fix container-facing defaults: RPC must bind `0.0.0.0` in Docker/devnet, and P2P listen ports must match exposed ports or be discoverable.
-- [ ] Complete sync request/response publication and serving in daemon runtime.
+- [x] Add per-node devnet config generation with unique state directories, producer keys, RPC ports, and bootstrap multiaddrs.
+- [x] Fix container-facing defaults: RPC must bind `0.0.0.0` in Docker/devnet, and P2P listen ports must match exposed ports or be discoverable.
+- [x] Complete sync request/response publication and serving in daemon runtime.
+- [x] Add snapshot advertisement gossip and targeted sync request/response peer identities.
+- [x] Add a single devnet command surface for generation, local/Docker bring-up, health checks, logs, smoke, and teardown.
 - [ ] Add an end-to-end devnet test that starts 3 nodes, submits a transaction, produces/finalizes blocks, restarts a node, and verifies RPC/indexer recovery.
-- [ ] Document a single command for local devnet bring-up, health checks, and teardown.
+- [ ] Extend devnet smoke to assert lagging-node snapshot catch-up under real process/network churn.
 
 ### P1: Validator and Staking Lifecycle
 

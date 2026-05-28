@@ -106,6 +106,12 @@ Build:
 cargo build
 ```
 
+Rust build artifacts live under `target/` and can grow quickly during repeated debug/test builds. This repo keeps full debug info for the local crate but disables dependency debug info in the dev profile to reduce disk usage. To reclaim all generated artifacts:
+
+```bash
+cargo clean
+```
+
 Run all tests:
 
 ```bash
@@ -223,6 +229,7 @@ Useful options:
 - `--no-listen` skip opening local listen sockets
 - `--no-bootstrap` skip DNS/fallback bootstrap dial attempts
 - `--strict-bootstrap` fail startup if bootstrap cannot dial
+- `--listen-multiaddr <MULTIADDR>` repeatable P2P listen address override
 - `--event-loop-tick-ms <U64>` runtime maintenance tick interval
 - `--slot-duration-ms <U64>` consensus slot duration used for leader scheduling
 - `--max-block-transactions <USIZE>` transaction cap for one locally produced block
@@ -235,6 +242,8 @@ Useful options:
 - `--strict-recovery <BOOL>` fail closed on recovered-state coherence issues
 - `--repair-index <BOOL>` rebuild retained finalized indexes on startup
 - `--ignore-mempool-checkpoint <BOOL>` skip mempool checkpoint ingestion during startup
+- `--sync-advertisement-interval-ms <U64>` finalized snapshot advertisement interval
+- `--snapshot-serve-cache-entries <USIZE>` number of recent snapshots retained for peer sync serving
 
 Runtime behavior notes:
 
@@ -246,6 +255,33 @@ Runtime behavior notes:
 - pending blocks are finalized only when height and parent hash match the current finalized tip
 - invalid/stale blocks are rejected; out-of-order future blocks are retained until parent blocks arrive
 - transactions included in finalized blocks are evicted from mempool
+
+## Local Devnet
+
+Generate three per-node configs:
+
+```bash
+bash scripts/devnet.sh generate
+```
+
+Run a local-process devnet:
+
+```bash
+bash scripts/devnet.sh up
+bash scripts/devnet.sh status
+bash scripts/devnet.sh smoke
+bash scripts/devnet.sh down
+```
+
+Run the same generated topology through Docker Compose:
+
+```bash
+HOMA_DEVNET_MODE=docker bash scripts/devnet.sh up
+HOMA_DEVNET_MODE=docker bash scripts/devnet.sh logs
+HOMA_DEVNET_MODE=docker bash scripts/devnet.sh down
+```
+
+The generated state and configs are stored under `.homa-devnet/`. Local RPC ports are `8545`, `8546`, and `8547`; P2P TCP/QUIC ports are stable per node.
 
 ## JSON-RPC and WebSocket API
 
@@ -297,10 +333,13 @@ Current gossip topics:
 - `blocks`
 - `sync-requests`
 - `sync-chunks`
+- `sync-advertisements`
 
 Sync transport includes:
 
 - bounded encode/decode for request/response envelopes
+- finalized snapshot advertisements over gossip
+- targeted chunk requests/responses using requester, target, and responder peer ids
 - malformed/oversized payload rejection
 - retry-aware outbound chunk scheduler
 - serve-side peer quota limiter

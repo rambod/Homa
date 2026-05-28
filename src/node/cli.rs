@@ -74,6 +74,9 @@ struct NodeRunArgs {
     /// Fallback bootstrap entries (`IP`, `IP:PORT`, or full multiaddr).
     #[arg(long = "fallback-bootstrap")]
     fallback_bootstrap: Vec<String>,
+    /// Explicit P2P listen multiaddr. May be provided multiple times.
+    #[arg(long = "listen-multiaddr")]
+    listen_multiaddr: Vec<String>,
     /// Do not open listen sockets.
     #[arg(long, default_value_t = false)]
     no_listen: bool,
@@ -125,6 +128,12 @@ struct NodeRunArgs {
     /// Skip mempool checkpoint ingestion during startup recovery.
     #[arg(long)]
     ignore_mempool_checkpoint: Option<bool>,
+    /// Interval for advertising finalized snapshot metadata to peers.
+    #[arg(long)]
+    sync_advertisement_interval_ms: Option<u64>,
+    /// Number of recent finalized snapshots retained for serving peers.
+    #[arg(long)]
+    snapshot_serve_cache_entries: Option<usize>,
     /// Run only a bounded number of event-loop iterations then exit.
     #[arg(long)]
     max_steps: Option<usize>,
@@ -624,6 +633,8 @@ fn daemon_config_from_runtime(
     config.strict_recovery = runtime_config.strict_recovery;
     config.repair_index = runtime_config.repair_index;
     config.ignore_mempool_checkpoint = runtime_config.ignore_mempool_checkpoint;
+    config.sync_advertisement_interval_ms = runtime_config.sync_advertisement_interval_ms;
+    config.snapshot_serve_cache_entries = runtime_config.snapshot_serve_cache_entries;
     config.producer_secret_key = runtime_config
         .producer_secret_key_bytes()
         .map_err(|source| NodeCliError::Config {
@@ -669,11 +680,19 @@ fn initialize_daemon(runtime_config: &NodeRuntimeConfig) -> Result<NodeDaemon, N
             source: Box::new(source),
         })?;
     if runtime_config.listen {
-        daemon
-            .listen_on_default_addresses()
-            .map_err(|source| NodeCliError::Daemon {
-                source: Box::new(source),
-            })?;
+        if runtime_config.listen_multiaddrs.is_empty() {
+            daemon
+                .listen_on_default_addresses()
+                .map_err(|source| NodeCliError::Daemon {
+                    source: Box::new(source),
+                })?;
+        } else {
+            daemon
+                .listen_on_addresses(&runtime_config.listen_multiaddrs)
+                .map_err(|source| NodeCliError::Daemon {
+                    source: Box::new(source),
+                })?;
+        }
     }
     Ok(daemon)
 }
@@ -881,6 +900,7 @@ fn runtime_overrides_from_args(args: NodeRunArgs) -> NodeRuntimeOverrides {
         seed_domain: args.seed_domain,
         fallback_bootstrap: (!args.fallback_bootstrap.is_empty())
             .then_some(args.fallback_bootstrap),
+        listen_multiaddrs: (!args.listen_multiaddr.is_empty()).then_some(args.listen_multiaddr),
         no_listen: args.no_listen,
         no_bootstrap: args.no_bootstrap,
         strict_bootstrap: args.strict_bootstrap,
@@ -898,6 +918,8 @@ fn runtime_overrides_from_args(args: NodeRunArgs) -> NodeRuntimeOverrides {
         strict_recovery: args.strict_recovery,
         repair_index: args.repair_index,
         ignore_mempool_checkpoint: args.ignore_mempool_checkpoint,
+        sync_advertisement_interval_ms: args.sync_advertisement_interval_ms,
+        snapshot_serve_cache_entries: args.snapshot_serve_cache_entries,
         max_steps: args.max_steps,
         state_directory: args.state_directory,
         producer_secret_key_hex: args.producer_secret_key_hex,

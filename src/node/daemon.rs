@@ -1,6 +1,6 @@
 //! Node daemon skeleton and runtime event-loop wiring.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::path::Path;
 use std::str::FromStr;
@@ -33,7 +33,10 @@ use crate::core::recovery::{
 };
 use crate::core::state::ChainState;
 use crate::core::state::StateError;
-use crate::core::sync::{SnapshotAdmissionPolicy, SnapshotImportMode};
+use crate::core::sync::{
+    SnapshotAdmissionPolicy, SnapshotChunk, SnapshotImportMode, build_state_snapshot,
+    import_verified_snapshot_with_policy, split_snapshot_into_chunks,
+};
 use crate::core::transaction::Transaction;
 use crate::crypto::address::{AddressError, Network, derive_address};
 use crate::crypto::keys::{CryptoError, Keypair, SECRET_KEY_LENGTH};
@@ -42,13 +45,14 @@ use crate::network::checkpoint_rotation::{
 };
 use crate::network::p2p::{
     DEFAULT_BOOTSTRAP_QUIC_PORT, DEFAULT_BOOTSTRAP_TCP_PORT, HomaBehaviour, HomaBehaviourEvent,
-    NetworkError, P2PConfig, add_kademlia_address, blocks_topic, bootstrap_dht, build_swarm,
-    resolve_bootstrap_addresses,
+    NetworkError, P2PConfig, SnapshotAdvertisement, SnapshotChunkRequest, SnapshotChunkResponse,
+    add_kademlia_address, blocks_topic, bootstrap_dht, build_swarm, encode_snapshot_advertisement,
+    encode_snapshot_chunk_request, encode_snapshot_chunk_response, resolve_bootstrap_addresses,
+    sync_advertisements_topic, sync_chunks_topic, sync_requests_topic,
 };
 use crate::network::reputation::{AdaptivePenaltyPolicy, ReputationEvent, ReputationPolicy};
 use crate::network::runtime_loop::{
-    InboundGossipAction, RuntimeLoopError,
-    handle_inbound_gossip_message_with_feedback_and_sync_runtime,
+    InboundGossipAction, RuntimeLoopError, handle_inbound_gossip_message_with_feedback,
 };
 use crate::network::runtime_policy::{RuntimePolicyError, SyncRuntimePolicyController};
 use crate::network::sync_engine::{ChunkServePolicy, ChunkSessionPolicy, RequestSchedulerPolicy};
@@ -57,7 +61,8 @@ use crate::network::sync_engine::{
     recover_sync_runtime_checkpoint,
 };
 use crate::network::sync_runtime::{
-    SnapshotImportFailurePolicy, SyncRuntimeCoordinator, SyncRuntimeError,
+    AssemblyIngestOutcome, SnapshotImportFailurePolicy, SnapshotStreamKey, SyncRuntimeCoordinator,
+    SyncRuntimeError,
 };
 use crate::observability::{GossipOperation, Observability};
 
@@ -77,6 +82,10 @@ pub const DEFAULT_INDEX_MAX_RETAINED_BLOCKS: usize = 100_000;
 const NORMALIZED_GENESIS_STAKE_SCALE: u64 = 10_000;
 /// Maximum publish attempts for one locally produced block.
 const BLOCK_PUBLISH_MAX_ATTEMPTS: usize = 3;
+/// Default sync advertisement interval in milliseconds.
+pub const DEFAULT_SYNC_ADVERTISEMENT_INTERVAL_MS: u64 = 5_000;
+/// Default number of finalized snapshots retained for sync serving.
+pub const DEFAULT_SNAPSHOT_SERVE_CACHE_ENTRIES: usize = 4;
 /// Canonical persisted finalized-block checkpoint filename.
 pub const FINALIZED_BLOCK_CHECKPOINT_FILE_NAME: &str = "finalized_block.checkpoint";
 /// Maximum allowed inbound block future skew measured in slot intervals.
@@ -111,6 +120,10 @@ pub struct NodeDaemonConfig {
     pub snapshot_chunk_bytes: usize,
     /// Snapshot import failure/quarantine policy.
     pub snapshot_import_failure_policy: SnapshotImportFailurePolicy,
+    /// Interval for advertising finalized snapshot metadata to peers.
+    pub sync_advertisement_interval_ms: u64,
+    /// Number of recent finalized snapshots retained for serving peers.
+    pub snapshot_serve_cache_entries: usize,
     /// Bounded in-memory observability event capacity.
     pub observability_event_capacity: usize,
     /// Runtime event-loop tick interval in milliseconds.
@@ -168,6 +181,8 @@ impl Default for NodeDaemonConfig {
             snapshot_admission_policy: SnapshotAdmissionPolicy::default(),
             snapshot_chunk_bytes: crate::core::sync::DEFAULT_SNAPSHOT_CHUNK_BYTES,
             snapshot_import_failure_policy: SnapshotImportFailurePolicy::default(),
+            sync_advertisement_interval_ms: DEFAULT_SYNC_ADVERTISEMENT_INTERVAL_MS,
+            snapshot_serve_cache_entries: DEFAULT_SNAPSHOT_SERVE_CACHE_ENTRIES,
             observability_event_capacity: crate::observability::DEFAULT_EVENT_CAPACITY,
             event_loop_tick_ms: DEFAULT_EVENT_LOOP_TICK_MS,
             slot_duration_ms: DEFAULT_SLOT_DURATION_MS,
@@ -221,6 +236,8 @@ pub enum NodeInboundOutcome {
         /// Response request id.
         request_id: u64,
     },
+    /// Sync advertisement was accepted and any missing chunk requests were scheduled.
+    SyncAdvertisementAccepted,
     /// Checkpoint trust-rotation update ingest outcome.
     CheckpointRotationIngested {
         /// Rotation ingest result.
@@ -714,6 +731,14 @@ struct LocalBlockProducer {
     last_observed_slot: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServedSnapshot {
+    stream: SnapshotStreamKey,
+    finalized_block: Block,
+    chunk_bytes: usize,
+    chunks: Vec<SnapshotChunk>,
+}
+
 /// Long-running daemon skeleton that wires runtime policy + sync + mempool handling.
 pub struct NodeDaemon {
     config: NodeDaemonConfig,
@@ -734,6 +759,10 @@ pub struct NodeDaemon {
     persistence_directory: Option<std::path::PathBuf>,
     indexer: Option<FinalizedIndexer>,
     last_mempool_checkpoint_unix_ms: Option<u64>,
+    last_sync_advertisement_unix_ms: Option<u64>,
+    next_sync_request_id: u64,
+    snapshot_serve_cache: VecDeque<ServedSnapshot>,
+    advertised_finalized_blocks: HashMap<SnapshotStreamKey, Block>,
     swarm: Option<Swarm<HomaBehaviour>>,
 }
 
@@ -919,6 +948,10 @@ impl NodeDaemon {
             persistence_directory: None,
             indexer: None,
             last_mempool_checkpoint_unix_ms: None,
+            last_sync_advertisement_unix_ms: None,
+            next_sync_request_id: 1,
+            snapshot_serve_cache: VecDeque::new(),
+            advertised_finalized_blocks: HashMap::new(),
             swarm: None,
         })
     }
@@ -938,25 +971,27 @@ impl NodeDaemon {
 
     /// Opens default TCP+QUIC listen sockets on the attached swarm.
     pub fn listen_on_default_addresses(&mut self) -> Result<(), NodeDaemonError> {
-        let tcp =
-            Multiaddr::from_str("/ip4/0.0.0.0/tcp/0").map_err(|_| NodeDaemonError::Network {
-                source: NetworkError::ListenAddress,
-            })?;
-        let quic = Multiaddr::from_str("/ip4/0.0.0.0/udp/0/quic-v1").map_err(|_| {
-            NodeDaemonError::Network {
-                source: NetworkError::ListenAddress,
-            }
-        })?;
+        self.listen_on_addresses(["/ip4/0.0.0.0/tcp/0", "/ip4/0.0.0.0/udp/0/quic-v1"])
+    }
 
+    /// Opens explicit P2P listen sockets on the attached swarm.
+    pub fn listen_on_addresses<I, S>(&mut self, addresses: I) -> Result<(), NodeDaemonError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         let swarm = self.swarm_mut()?;
-        swarm.listen_on(tcp).map_err(|_| NodeDaemonError::Network {
-            source: NetworkError::ListenAddress,
-        })?;
-        swarm
-            .listen_on(quic)
-            .map_err(|_| NodeDaemonError::Network {
-                source: NetworkError::ListenAddress,
-            })?;
+        for address in addresses {
+            let parsed =
+                Multiaddr::from_str(address.as_ref()).map_err(|_| NodeDaemonError::Network {
+                    source: NetworkError::ListenAddress,
+                })?;
+            swarm
+                .listen_on(parsed)
+                .map_err(|_| NodeDaemonError::Network {
+                    source: NetworkError::ListenAddress,
+                })?;
+        }
         Ok(())
     }
 
@@ -1012,9 +1047,8 @@ impl NodeDaemon {
                 state: self.lifecycle_state,
             });
         }
-        let action = handle_inbound_gossip_message_with_feedback_and_sync_runtime(
+        let action = handle_inbound_gossip_message_with_feedback(
             &mut self.controller,
-            &mut self.sync_runtime,
             topic,
             payload,
             peer_id,
@@ -1089,12 +1123,14 @@ impl NodeDaemon {
                 Ok(NodeInboundOutcome::BlockQueued { height })
             }
             InboundGossipAction::SyncChunkRequest(request) => {
+                self.serve_inbound_sync_request(peer_id, request.clone());
                 self.stats.sync_requests_total = self.stats.sync_requests_total.saturating_add(1);
                 Ok(NodeInboundOutcome::SyncChunkRequestAccepted {
                     request_id: request.request_id,
                 })
             }
             InboundGossipAction::SyncChunkResponse(response) => {
+                self.accept_inbound_sync_response(peer_id, response.clone())?;
                 self.stats.sync_responses_total = self.stats.sync_responses_total.saturating_add(1);
                 self.controller.record_peer_event(
                     peer_id,
@@ -1104,6 +1140,10 @@ impl NodeDaemon {
                 Ok(NodeInboundOutcome::SyncChunkResponseAccepted {
                     request_id: response.request_id,
                 })
+            }
+            InboundGossipAction::SyncAdvertisement(advertisement) => {
+                self.handle_sync_advertisement(peer_id, advertisement, now_ms)?;
+                Ok(NodeInboundOutcome::SyncAdvertisementAccepted)
             }
             InboundGossipAction::CheckpointRotation { outcome } => {
                 self.stats.checkpoint_rotations_total =
@@ -1126,6 +1166,15 @@ impl NodeDaemon {
         for retry in &timeout_feedback.retries {
             self.controller
                 .record_peer_event(&retry.peer_id, ReputationEvent::Timeout, now_ms);
+            if let Ok(crate::network::sync_runtime::RetryDispatchActivation::Ready {
+                request,
+                ..
+            }) = self
+                .sync_runtime
+                .activate_retry_dispatch(retry.request_id, now_ms)
+            {
+                let _ = self.publish_sync_request_best_effort(request);
+            }
         }
         for exhausted in &timeout_feedback.exhausted {
             self.controller
@@ -1134,6 +1183,14 @@ impl NodeDaemon {
 
         let block_processing = self.process_pending_blocks(self.config.max_pending_blocks)?;
         let production = self.maybe_produce_local_block(now_ms)?;
+        let should_advertise = self.last_sync_advertisement_unix_ms.is_none_or(|last| {
+            now_ms.saturating_sub(last) >= self.config.sync_advertisement_interval_ms
+        });
+        if (production.produced_blocks > 0 || should_advertise)
+            && self.publish_sync_advertisement_best_effort(now_ms)
+        {
+            self.last_sync_advertisement_unix_ms = Some(now_ms);
+        }
         self.maybe_persist_mempool_checkpoint(now_ms)?;
 
         let import_mode = SnapshotImportMode::SteadyState {
@@ -1512,6 +1569,265 @@ impl NodeDaemon {
             "no peers subscribed to block topic",
         );
         false
+    }
+
+    fn local_peer_id_string(&self) -> Option<String> {
+        self.swarm
+            .as_ref()
+            .map(|swarm| swarm.local_peer_id().to_string())
+    }
+
+    fn cache_current_snapshot(&mut self) -> Result<Option<SnapshotAdvertisement>, NodeDaemonError> {
+        let snapshot = build_state_snapshot(&self.chain_state, self.finalized_block.header.height);
+        let chunks = split_snapshot_into_chunks(&snapshot, self.config.snapshot_chunk_bytes)
+            .map_err(|source| NodeDaemonError::SyncRuntime {
+                source: SyncRuntimeError::SnapshotAssembly { source },
+            })?;
+        let Some(first_chunk) = chunks.first() else {
+            return Ok(None);
+        };
+        let total_chunks = first_chunk.total_chunks;
+        let snapshot_hash = first_chunk.snapshot_hash;
+        let stream = SnapshotStreamKey {
+            block_height: snapshot.block_height,
+            state_root: snapshot.state_root,
+            snapshot_hash,
+            total_chunks,
+        };
+
+        if self
+            .snapshot_serve_cache
+            .back()
+            .is_some_and(|cached| cached.stream == stream)
+        {
+            return Ok(Some(SnapshotAdvertisement {
+                finalized_block: self.finalized_block.clone(),
+                snapshot_hash,
+                total_chunks,
+                chunk_bytes: self.config.snapshot_chunk_bytes,
+                advertised_at_unix_ms: now_unix_ms(),
+            }));
+        }
+
+        self.snapshot_serve_cache.push_back(ServedSnapshot {
+            stream,
+            finalized_block: self.finalized_block.clone(),
+            chunk_bytes: self.config.snapshot_chunk_bytes,
+            chunks,
+        });
+        while self.snapshot_serve_cache.len() > self.config.snapshot_serve_cache_entries {
+            let _ = self.snapshot_serve_cache.pop_front();
+        }
+
+        Ok(Some(SnapshotAdvertisement {
+            finalized_block: self.finalized_block.clone(),
+            snapshot_hash,
+            total_chunks,
+            chunk_bytes: self.config.snapshot_chunk_bytes,
+            advertised_at_unix_ms: now_unix_ms(),
+        }))
+    }
+
+    fn publish_sync_advertisement_best_effort(&mut self, now_ms: u64) -> bool {
+        let Ok(Some(mut advertisement)) = self.cache_current_snapshot() else {
+            return false;
+        };
+        advertisement.advertised_at_unix_ms = now_ms;
+        let Ok(payload) = encode_snapshot_advertisement(advertisement) else {
+            return false;
+        };
+        self.publish_gossipsub_best_effort(sync_advertisements_topic(), &payload)
+    }
+
+    fn publish_sync_request_best_effort(&mut self, request: SnapshotChunkRequest) -> bool {
+        let Ok(payload) = encode_snapshot_chunk_request(request) else {
+            return false;
+        };
+        self.publish_gossipsub_best_effort(sync_requests_topic(), &payload)
+    }
+
+    fn publish_sync_response_best_effort(&mut self, response: SnapshotChunkResponse) -> bool {
+        let Ok(payload) = encode_snapshot_chunk_response(response) else {
+            return false;
+        };
+        self.publish_gossipsub_best_effort(sync_chunks_topic(), &payload)
+    }
+
+    fn publish_gossipsub_best_effort(
+        &mut self,
+        topic: libp2p::gossipsub::IdentTopic,
+        payload: &[u8],
+    ) -> bool {
+        let Some(swarm) = self.swarm.as_mut() else {
+            return false;
+        };
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(topic, payload.to_owned())
+            .is_ok()
+    }
+
+    fn handle_sync_advertisement(
+        &mut self,
+        peer_id: &str,
+        advertisement: SnapshotAdvertisement,
+        now_ms: u64,
+    ) -> Result<(), NodeDaemonError> {
+        if advertisement.finalized_block.header.height <= self.finalized_block.header.height {
+            return Ok(());
+        }
+        advertisement
+            .finalized_block
+            .validate_proposer_proof_for_network(self.config.network)
+            .map_err(|source| NodeDaemonError::BlockConsensus { source })?;
+        if advertisement.finalized_block.header.state_root == self.chain_state.state_root() {
+            return Ok(());
+        }
+        let Some(requester_peer_id) = self.local_peer_id_string() else {
+            return Ok(());
+        };
+
+        let stream = SnapshotStreamKey {
+            block_height: advertisement.finalized_block.header.height,
+            state_root: advertisement.finalized_block.header.state_root,
+            snapshot_hash: advertisement.snapshot_hash,
+            total_chunks: advertisement.total_chunks,
+        };
+        let _ = self
+            .advertised_finalized_blocks
+            .insert(stream, advertisement.finalized_block);
+
+        for chunk_index in 0..advertisement.total_chunks {
+            let request_id = self.next_sync_request_id;
+            self.next_sync_request_id = self.next_sync_request_id.saturating_add(1);
+            let request = SnapshotChunkRequest {
+                request_id,
+                requester_peer_id: requester_peer_id.clone(),
+                target_peer_id: peer_id.to_owned(),
+                block_height: stream.block_height,
+                state_root: stream.state_root,
+                snapshot_hash: stream.snapshot_hash,
+                chunk_index,
+                total_chunks: stream.total_chunks,
+            };
+            let scheduled = self
+                .sync_runtime
+                .schedule_outbound_request(peer_id, stream.block_height, request.clone(), now_ms)
+                .map_err(|source| NodeDaemonError::SyncRuntime { source })?;
+            if matches!(
+                scheduled,
+                crate::network::sync_runtime::OutboundRequestScheduleOutcome::Scheduled { .. }
+            ) {
+                let _ = self.publish_sync_request_best_effort(request);
+            }
+        }
+        Ok(())
+    }
+
+    fn serve_inbound_sync_request(&mut self, peer_id: &str, request: SnapshotChunkRequest) {
+        let Some(local_peer_id) = self.local_peer_id_string() else {
+            return;
+        };
+        if request.target_peer_id != local_peer_id {
+            return;
+        }
+        if request.requester_peer_id != peer_id {
+            return;
+        }
+        let response = self
+            .snapshot_serve_cache
+            .iter()
+            .find(|cached| {
+                cached.stream.block_height == request.block_height
+                    && cached.stream.state_root == request.state_root
+                    && cached.stream.snapshot_hash == request.snapshot_hash
+                    && cached.stream.total_chunks == request.total_chunks
+            })
+            .and_then(|cached| {
+                cached
+                    .chunks
+                    .get(usize::try_from(request.chunk_index).ok()?)
+            })
+            .map(|chunk| SnapshotChunkResponse {
+                request_id: request.request_id,
+                requester_peer_id: request.requester_peer_id,
+                responder_peer_id: local_peer_id,
+                chunk: chunk.clone(),
+            });
+        if let Some(response) = response {
+            let _ = self.publish_sync_response_best_effort(response);
+        }
+    }
+
+    fn accept_inbound_sync_response(
+        &mut self,
+        peer_id: &str,
+        response: SnapshotChunkResponse,
+    ) -> Result<(), NodeDaemonError> {
+        if let Some(local_peer_id) = self.local_peer_id_string()
+            && (response.requester_peer_id != local_peer_id
+                || response.responder_peer_id != peer_id)
+        {
+            return Ok(());
+        }
+        let accepted = self
+            .sync_runtime
+            .handle_inbound_chunk_response(peer_id, response)
+            .map_err(|source| NodeDaemonError::SyncRuntime { source })?;
+        if let AssemblyIngestOutcome::Complete { stream } = accepted.assembly {
+            if self.advertised_finalized_blocks.contains_key(&stream) {
+                let _ = self.import_completed_advertised_snapshots(Some(stream));
+            }
+        }
+        Ok(())
+    }
+
+    fn import_completed_advertised_snapshots(
+        &mut self,
+        completed_stream: Option<SnapshotStreamKey>,
+    ) -> Result<usize, NodeDaemonError> {
+        let completed = self.sync_runtime.drain_completed_snapshots();
+        let mut imported = 0_usize;
+        for snapshot in completed {
+            if completed_stream.is_some_and(|stream| stream != snapshot.stream) {
+                continue;
+            }
+            let Some(finalized_block) = self
+                .advertised_finalized_blocks
+                .get(&snapshot.stream)
+                .cloned()
+            else {
+                continue;
+            };
+            import_verified_snapshot_with_policy(
+                &mut self.chain_state,
+                &snapshot.snapshot,
+                &finalized_block,
+                self.config.snapshot_admission_policy,
+                SnapshotImportMode::SteadyState {
+                    local_finalized_height: self.finalized_block.header.height,
+                },
+            )
+            .map_err(|source| NodeDaemonError::SyncRuntime {
+                source: SyncRuntimeError::SnapshotImport {
+                    block_height: snapshot.stream.block_height,
+                    state_root: snapshot.stream.state_root,
+                    failure_count: 1,
+                    source,
+                },
+            })?;
+            if let Some(indexer) = self.indexer.as_ref() {
+                let _ = indexer
+                    .append_finalized_block(&finalized_block, now_unix_ms())
+                    .map_err(|source| NodeDaemonError::Indexer { source })?;
+            }
+            self.finalized_block = finalized_block;
+            self.stats.snapshot_imported_total =
+                self.stats.snapshot_imported_total.saturating_add(1);
+            imported = imported.saturating_add(1);
+        }
+        Ok(imported)
     }
 
     /// Handles one raw swarm event and routes gossipsub messages through daemon inbound handling.
@@ -3314,6 +3630,8 @@ mod tests {
         for (index, chunk) in chunks.iter().enumerate() {
             let request = SnapshotChunkRequest {
                 request_id: u64::try_from(index).unwrap_or(u64::MAX) + 1_000,
+                requester_peer_id: "peer-requester".to_owned(),
+                target_peer_id: "peer-target".to_owned(),
                 block_height: chunk.block_height,
                 state_root: chunk.state_root,
                 snapshot_hash: chunk.snapshot_hash,
@@ -3323,13 +3641,15 @@ mod tests {
             let scheduled = daemon.sync_runtime_mut().schedule_outbound_request(
                 "peer-sync",
                 7,
-                request,
+                request.clone(),
                 15_000,
             );
             assert!(scheduled.is_ok(), "outbound request should schedule");
 
             let encoded = encode_snapshot_chunk_response(SnapshotChunkResponse {
                 request_id: request.request_id,
+                requester_peer_id: "peer-requester".to_owned(),
+                responder_peer_id: "peer-target".to_owned(),
                 chunk: chunk.clone(),
             });
             assert!(encoded.is_ok(), "chunk response should encode");
@@ -3760,6 +4080,8 @@ mod tests {
             7,
             SnapshotChunkRequest {
                 request_id: 42,
+                requester_peer_id: "peer-requester".to_owned(),
+                target_peer_id: "peer-target".to_owned(),
                 block_height: 1,
                 state_root: [3_u8; 32],
                 snapshot_hash: [4_u8; 32],
@@ -3799,6 +4121,8 @@ mod tests {
             7,
             SnapshotChunkRequest {
                 request_id: 77,
+                requester_peer_id: "peer-requester".to_owned(),
+                target_peer_id: "peer-target".to_owned(),
                 block_height: 1,
                 state_root: [3_u8; 32],
                 snapshot_hash: [4_u8; 32],

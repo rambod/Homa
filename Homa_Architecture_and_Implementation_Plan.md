@@ -617,8 +617,8 @@ This audit reviewed the tracked source, tests, deploy assets, runbooks, and proj
 
 - [ ] **Distributed Finality:** Current finalization is proposer/local-state driven. Production needs validator votes, quorum certificates, certificate gossip, and fail-closed finality checks.
 - [ ] **On-Chain Validator Lifecycle:** Validator set and stake weights are genesis/bootstrap derived. Production needs registration, staking, unstaking, epoch activation, unbonding, and slashing/evidence handling.
-- [ ] **End-to-End Sync Transport:** Sync codecs, scheduling, and runtime assembly exist, but daemon-level request publication, chunk serving, response publication, and real-swarm tests must be completed.
-- [ ] **Devnet Automation:** Docker/systemd assets exist, but per-node generated configs, stable P2P ports, container RPC bind addresses, producer keys, bootstrap multiaddrs, and state volumes need a reliable one-command workflow.
+- [x] **End-to-End Sync Transport:** Sync codecs, scheduling, runtime assembly, daemon-level request publication, chunk serving, response publication, and advertised snapshot import are implemented; real-swarm stress tests remain.
+- [x] **Devnet Automation:** Per-node generated configs, stable P2P ports, container RPC bind addresses, producer keys, bootstrap multiaddrs, and state volumes now have a one-command workflow.
 - [ ] **Observability Export:** In-process counters/events exist; production needs metrics export, alert rules, dashboards, and structured log conventions.
 - [ ] **Operational Runbooks:** Baseline runbooks now include commands and checks, but production still needs drill-validated procedures, rollback criteria, ownership, and incident decision trees.
 - [ ] **Security Release Readiness:** Mainnet readiness requires threat modeling, external review, longer fuzz/soak runs, reproducible artifacts, key-management policy, and genesis ceremony tooling.
@@ -663,13 +663,23 @@ Prove the implemented runtime pieces work together over real libp2p swarms, real
 
 ### Task List
 
-- [ ] **Daemon Sync Publishing:** Wire outbound `SnapshotChunkRequest` publication from scheduler decisions and peer selection into gossipsub.
-- [ ] **Chunk Serve Path:** On accepted sync requests, call `serve_chunk_request(...)`, encode `SnapshotChunkResponse`, and publish it to the sync chunk topic with reputation-aware serve limits.
+- [x] **Daemon Sync Publishing:** Wire outbound `SnapshotChunkRequest` publication from scheduler decisions and peer selection into gossipsub.
+- [x] **Chunk Serve Path:** On accepted sync requests, serve cached snapshot chunks, encode `SnapshotChunkResponse`, and publish it to the sync chunk topic.
 - [ ] **Real-Swarm E2E Tests:** Start multiple local swarms, submit transactions, produce blocks, force one node behind, sync it forward, and verify converged height/state root/index queries.
-- [ ] **Devnet Config Generator:** Generate per-node `node.toml` files with unique state directories, RPC ports, producer keys, bootstrap multiaddrs, and stable P2P listen addresses.
-- [ ] **Docker Compose Hardening:** Use generated configs, bind RPC to `0.0.0.0` inside containers, align exposed P2P ports with daemon listen ports, and persist state volumes.
-- [ ] **Operator Smoke Command:** Add one command/script that builds, launches, health-checks, and tears down a three-node devnet.
+- [x] **Devnet Config Generator:** Generate per-node `node.toml` files with unique state directories, RPC ports, producer keys, bootstrap multiaddrs, and stable P2P listen addresses.
+- [x] **Docker Compose Hardening:** Use generated configs, bind RPC to `0.0.0.0` inside containers, align exposed P2P ports with daemon listen ports, and persist state volumes.
+- [x] **Operator Smoke Command:** Add one command/script that builds, launches, health-checks, and tears down a three-node devnet.
 - [ ] **Restart Drill:** Add an automated test that restarts one devnet node and verifies state, mempool, sync checkpoint, finalized checkpoint, and index recovery.
+
+### Implementation Update (2026-05-28)
+
+- [x] **Build Artifact Control:** Dev builds keep local-crate debug info while disabling dependency debug info to reduce `target/` growth; `cargo clean` workflow is documented.
+- [x] **Stable Listen Config:** Node config and CLI now accept explicit `listen_multiaddrs`; devnet nodes use stable TCP/QUIC ports instead of random listen sockets.
+- [x] **Sync Advertisements:** Added `sync-advertisements` gossip and a `SnapshotAdvertisement` wire payload carrying finalized block, snapshot hash, chunk count, chunk size, and advertised timestamp.
+- [x] **Targeted Chunk Sync:** `SnapshotChunkRequest` and `SnapshotChunkResponse` now carry requester/target/responder peer identities; non-target daemon messages are ignored before serving/accepting.
+- [x] **Daemon Sync Orchestration:** Maintenance ticks advertise cached finalized snapshots, schedule chunk requests from peer advertisements, publish requests/retries, serve cached chunks, publish responses, and import completed advertised snapshots.
+- [x] **Devnet Command Surface:** `scripts/devnet.sh` generates a three-node devnet under `.homa-devnet/` and supports `generate`, `up`, `down`, `status`, `logs`, and `smoke` for local-process and Docker modes.
+- [ ] **Remaining Validation:** Add a stronger automated real-process devnet test that forces lag, restart, transaction submission, snapshot catch-up, and RPC/indexer convergence.
 
 ---
 
