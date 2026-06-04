@@ -15,9 +15,10 @@ This file is the short current roadmap. `../Homa_Architecture_and_Implementation
 | Blocks | Implemented: block/header model, transaction root, proposer proof validation, bounded decode. | `src/core/block.rs` |
 | Mempool | Implemented: PoW admission, fee/PoW priority, TTL pruning, sender/peer throttles, durable checkpoint recovery. | `src/core/mempool.rs`, `src/core/mempool_checkpoint.rs` |
 | Fast sync primitives | Implemented: snapshots, chunking, checkpoint verification, anti-rollback import, runtime assembly/quarantine, P2P advertisement/request/response orchestration. | `src/core/sync.rs`, `src/network/sync_runtime.rs`, `src/node/daemon.rs` |
-| P2P boundary | Implemented: libp2p swarm setup, gossipsub topics, Kademlia bootstrap helpers, targeted sync wire codecs, snapshot advertisements. | `src/network/p2p.rs` |
+| Finality | Implemented: `dev_self` and `quorum` modes, network-domain finality votes, quorum certificates, `finality-votes` gossip codec, duplicate/equivocation tracking, and certificate-gated pending block finalization in quorum mode. | `src/consensus/finality.rs`, `src/node/daemon.rs` |
+| P2P boundary | Implemented: libp2p swarm setup, gossipsub topics, Kademlia bootstrap helpers, targeted sync wire codecs, snapshot advertisements, finality vote gossip codec. | `src/network/p2p.rs` |
 | Reputation and runtime policy | Implemented: peer scoring, adaptive serve/dial penalties, checkpoint trust-set rotation. | `src/network/reputation.rs`, `src/network/runtime_policy.rs`, `src/network/checkpoint_rotation.rs` |
-| Node daemon | Implemented: lifecycle states, pending block finalization, local block production, restart recovery, persistence flush, swarm polling. | `src/node/daemon.rs` |
+| Node daemon | Implemented: lifecycle states, pending block finalization, local block production, quorum-gated finality mode, restart recovery, persistence flush, swarm polling. | `src/node/daemon.rs` |
 | RPC/WS | Implemented: JSON-RPC server, request limits, status/block/balance/tx/mempool/peer methods, WS subscriptions. | `src/node/rpc.rs` |
 | Persistent indexer | Implemented: finalized block event log, transaction/block/address indexes, rebuild and retention compaction. | `src/core/indexer.rs` |
 | Wallet CLI | Implemented: encrypted wallet, nonce state, local PoW, signed tx broadcast over gossipsub. | `src/wallet/cli.rs` |
@@ -26,7 +27,7 @@ This file is the short current roadmap. `../Homa_Architecture_and_Implementation
 
 ## Main Gaps
 
-1. **Distributed finality is not complete.** The node can produce, validate, self-finalize, and accept valid inbound blocks, but there is no validator vote/attestation quorum or finality certificate path.
+1. **Distributed finality needs real-swarm hardening.** Validator votes, quorum certificates, gossip decoding, and quorum-gated daemon finalization now exist, but partition semantics, certificate persistence/index exposure, and multi-process finality tests remain.
 2. **Validator membership is static.** Stake and trusted-checkpoint sets derive from deterministic genesis/bootstrap state. There is no on-chain staking, unbonding, validator activation, or slashing flow.
 3. **Devnet needs extended end-to-end validation.** Per-node generation, stable P2P ports, snapshot advertisements, request publication, chunk serving, and response import are implemented; the remaining work is a stronger multi-process transaction/restart/catch-up test.
 4. **Deployment config is still pre-production.** Devnet Docker/local tooling exists, but secrets, metrics, alerting, backup drills, and release artifacts still need production hardening.
@@ -38,11 +39,13 @@ This file is the short current roadmap. `../Homa_Architecture_and_Implementation
 
 ### P0: Production-Critical Protocol Safety
 
-- [ ] Define validator vote and finality certificate structures with network-domain-separated signatures.
-- [ ] Add vote gossip topic, vote admission, equivocation evidence, and duplicate vote handling.
-- [ ] Require quorum finality certificates before advancing finalized height for network-received blocks.
-- [ ] Keep local self-finalization only as a dev/test mode behind explicit config.
-- [ ] Add multi-validator tests for normal finality, delayed votes, partitions, equivocation, and invalid certificate rejection.
+- [x] Define validator vote and finality certificate structures with network-domain-separated signatures.
+- [x] Add vote gossip topic, vote admission, equivocation accounting, and duplicate vote handling.
+- [x] Require quorum finality certificates before advancing finalized height in explicit quorum mode.
+- [x] Keep local self-finalization as the default dev/test mode behind explicit config.
+- [x] Add focused multi-validator tests for normal quorum finality, missing quorum, wrong network, duplicate validator, and equivocation accounting.
+- [ ] Add real-swarm finality tests for delayed votes, partitions, invalid certificates, partition heal, and stalled finality recovery.
+- [ ] Persist/index finality certificate metadata and expose certificate details in block/RPC lookups beyond status counters.
 
 ### P0: Real Multi-Node Devnet
 
@@ -89,7 +92,8 @@ This file is the short current roadmap. `../Homa_Architecture_and_Implementation
 ## Definition of Done for Production Beta
 
 - [ ] A real multi-node devnet can run from clean checkout with one command.
-- [ ] Blocks finalize only with validator quorum certificates outside dev mode.
+- [x] Blocks finalize only with validator quorum certificates in explicit quorum mode.
+- [ ] Quorum mode is validated by real multi-process devnet tests under partitions, restart, and catch-up.
 - [ ] Validator set changes are deterministic, delayed by epoch rules, and covered by tests.
 - [ ] Node restart, backup/restore, and index/mempool recovery are tested in automation.
 - [ ] RPC and wallet flows are documented and covered by integration tests.

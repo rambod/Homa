@@ -615,7 +615,8 @@ This audit reviewed the tracked source, tests, deploy assets, runbooks, and proj
 
 ### Remaining Production Gaps
 
-- [ ] **Distributed Finality:** Current finalization is proposer/local-state driven. Production needs validator votes, quorum certificates, certificate gossip, and fail-closed finality checks.
+- [x] **Distributed Finality Slice:** Validator vote payloads, quorum certificates, finality vote gossip, duplicate/equivocation tracking, and explicit quorum-gated daemon finalization are implemented.
+- [ ] **Distributed Finality Hardening:** Production still needs real-swarm partition tests, persisted/indexed certificate metadata, fork/partition semantics around certified blocks, and validator lifecycle/slashing integration.
 - [ ] **On-Chain Validator Lifecycle:** Validator set and stake weights are genesis/bootstrap derived. Production needs registration, staking, unstaking, epoch activation, unbonding, and slashing/evidence handling.
 - [x] **End-to-End Sync Transport:** Sync codecs, scheduling, runtime assembly, daemon-level request publication, chunk serving, response publication, and advertised snapshot import are implemented; real-swarm stress tests remain.
 - [x] **Devnet Automation:** Per-node generated configs, stable P2P ports, container RPC bind addresses, producer keys, bootstrap multiaddrs, and state volumes now have a one-command workflow.
@@ -631,13 +632,23 @@ Move from local proposer self-finalization to network-finalized blocks backed by
 
 ### Task List
 
-- [ ] **Finality Vote Model:** Define validator vote/attestation payloads with domain-separated signing bytes, block hash binding, height/round/slot metadata, and validator address binding.
-- [ ] **Finality Certificate:** Define compact quorum certificates containing validator signatures, aggregate metadata, threshold validation, and deterministic encoding.
-- [ ] **Vote Gossip Topic:** Add a bounded `finality-votes` gossip topic with decode limits, duplicate vote suppression, equivocation detection, and reputation feedback.
-- [ ] **Certificate-Gated Finalization:** Require valid quorum certificates before advancing finalized height for network-received blocks. Keep self-finalization only as explicit dev/test mode.
+- [x] **Finality Vote Model:** Define validator vote/attestation payloads with domain-separated signing bytes, block hash binding, height/round metadata, and validator address binding.
+- [x] **Finality Certificate:** Define compact quorum certificates containing validator signatures, aggregate metadata, threshold validation, and deterministic encoding.
+- [x] **Vote Gossip Topic:** Add a bounded `finality-votes` gossip topic with decode limits, duplicate vote suppression, and equivocation accounting.
+- [x] **Certificate-Gated Finalization:** Require valid quorum certificates before advancing finalized height in explicit quorum mode. Keep self-finalization as the default dev/test mode behind explicit config.
 - [ ] **Fork/Partition Semantics:** Update fork choice and partition recovery so finalized certificates dominate local branch preference and prevent finalized-height rollback.
-- [ ] **RPC/Indexer Exposure:** Index finality certificate metadata and expose it in `homa_getStatus`, block lookups, and new finality-specific RPC fields.
-- [ ] **Regression Coverage:** Add multi-validator tests for normal quorum finality, delayed votes, missing votes, conflicting votes, invalid certificates, partition heal, and equivocation evidence.
+- [ ] **RPC/Indexer Exposure:** Persist/index finality certificate metadata and expose full certificate details in block lookups and new finality-specific RPC fields; `homa_getStatus` now exposes mode, threshold, latest certified height/hash, pending certificate count, and counters.
+- [ ] **Regression Coverage:** Add real-swarm and partition tests for delayed votes, conflicting votes, invalid certificates, partition heal, and stalled-finality recovery; focused unit tests now cover quorum success/failure, duplicate validator rejection, wrong-network rejection, and topic decoding.
+
+### Implementation Update (2026-06-04)
+
+- [x] Added `src/consensus/finality.rs` with `FinalityMode`, `FinalityVote`, `FinalityCertificate`, vote signing/verification, quorum certificate assembly, and certificate verification against the static genesis stake ledger.
+- [x] Added `finality-votes` gossip codec and runtime-loop decoding with bounded payload size.
+- [x] Added node config/CLI fields: `finality_mode` / `--finality-mode` and `finality_quorum_threshold_percent` / `--finality-quorum-threshold-percent`.
+- [x] Added quorum-mode daemon behavior: locally produced or received blocks remain pending until a stake-weighted certificate exists; `dev_self` remains the default for local smoke/dev workflows.
+- [x] Added finality status/counters to `homa_getStatus` and daemon runtime stats.
+- [x] Added focused tests for vote/certificate validation, wire roundtrip, topic dispatch, missing quorum, and quorum-gated block finalization.
+- [ ] Next production step: validate quorum mode across a real three-node devnet with partitions, delayed votes, node restart, snapshot catch-up, and certificate persistence.
 
 ---
 

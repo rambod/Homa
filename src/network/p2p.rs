@@ -21,6 +21,7 @@ use libp2p::{Multiaddr, PeerId, StreamProtocol, SwarmBuilder, noise, tcp, yamux}
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::consensus::finality::FinalityVote;
 use crate::core::block::{Block, MAX_BLOCK_BYTES};
 use crate::core::sync::SnapshotChunk;
 use crate::core::transaction::{
@@ -40,6 +41,8 @@ pub const SYNC_CHUNKS_TOPIC: &str = "sync-chunks";
 pub const SYNC_ADVERTISEMENTS_TOPIC: &str = "sync-advertisements";
 /// Gossipsub topic for checkpoint trust-set rotation updates.
 pub const CHECKPOINT_ROTATIONS_TOPIC: &str = "checkpoint-rotations";
+/// Gossipsub topic for validator finality votes.
+pub const FINALITY_VOTES_TOPIC: &str = "finality-votes";
 /// Upper bound for inbound block gossip payload size in bytes.
 pub const MAX_BLOCK_GOSSIP_BYTES: usize = MAX_BLOCK_BYTES;
 /// Default TCP port used for bootstrapping when DNS only returns plain IP addresses.
@@ -48,6 +51,8 @@ pub const DEFAULT_BOOTSTRAP_TCP_PORT: u16 = 7000;
 pub const DEFAULT_BOOTSTRAP_QUIC_PORT: u16 = 7001;
 /// Upper bound for sync wire message payload size.
 pub const MAX_SYNC_WIRE_MESSAGE_BYTES: usize = 256 * 1024;
+/// Upper bound for finality vote gossip payloads.
+pub const MAX_FINALITY_VOTE_BYTES: usize = 8 * 1024;
 
 /// Runtime configuration for P2P stack construction.
 pub struct P2PConfig {
@@ -330,6 +335,9 @@ pub fn build_swarm(config: P2PConfig) -> Result<Swarm<HomaBehaviour>, NetworkErr
             gossipsub
                 .subscribe(&IdentTopic::new(CHECKPOINT_ROTATIONS_TOPIC))
                 .map_err(|_| NetworkError::TopicSubscription)?;
+            gossipsub
+                .subscribe(&IdentTopic::new(FINALITY_VOTES_TOPIC))
+                .map_err(|_| NetworkError::TopicSubscription)?;
 
             let local_peer_id = PeerId::from(local_key.public());
             let kademlia_config = kad::Config::new(StreamProtocol::new(config.kad_protocol_name));
@@ -384,6 +392,12 @@ pub fn sync_advertisements_topic() -> IdentTopic {
 #[must_use]
 pub fn checkpoint_rotations_topic() -> IdentTopic {
     IdentTopic::new(CHECKPOINT_ROTATIONS_TOPIC)
+}
+
+/// Returns canonical topic descriptor for finality vote gossip.
+#[must_use]
+pub fn finality_votes_topic() -> IdentTopic {
+    IdentTopic::new(FINALITY_VOTES_TOPIC)
 }
 
 /// Decodes a transaction payload received from gossipsub.
@@ -530,6 +544,43 @@ pub fn decode_snapshot_advertisement(
             })
         }
     }
+}
+
+/// Encodes a finality vote into bounded gossip bytes.
+pub fn encode_finality_vote(vote: &FinalityVote) -> Result<Vec<u8>, NetworkError> {
+    let bytes = bincode::serde::encode_to_vec(
+        vote,
+        bincode::config::standard()
+            .with_fixed_int_encoding()
+            .with_little_endian(),
+    )
+    .map_err(|_| NetworkError::MalformedSyncPayload)?;
+    if bytes.len() > MAX_FINALITY_VOTE_BYTES {
+        return Err(NetworkError::SyncPayloadTooLarge {
+            actual: bytes.len(),
+            max: MAX_FINALITY_VOTE_BYTES,
+        });
+    }
+    Ok(bytes)
+}
+
+/// Decodes a finality vote from bounded gossip bytes.
+pub fn decode_finality_vote(payload: &[u8]) -> Result<FinalityVote, NetworkError> {
+    if payload.len() > MAX_FINALITY_VOTE_BYTES {
+        return Err(NetworkError::SyncPayloadTooLarge {
+            actual: payload.len(),
+            max: MAX_FINALITY_VOTE_BYTES,
+        });
+    }
+    bincode::serde::decode_from_slice(
+        payload,
+        bincode::config::standard()
+            .with_fixed_int_encoding()
+            .with_little_endian()
+            .with_limit::<MAX_FINALITY_VOTE_BYTES>(),
+    )
+    .map(|(vote, _)| vote)
+    .map_err(|_| NetworkError::MalformedSyncPayload)
 }
 
 /// Adds a known bootstrap peer to Kademlia and returns its peer id.
@@ -859,14 +910,16 @@ mod tests {
         MAX_SYNC_WIRE_MESSAGE_BYTES, NetworkError, P2PConfig, SnapshotAdvertisement,
         SnapshotChunkRequest, SnapshotChunkResponse, add_kademlia_address, blocks_topic,
         broadcast_transaction_bytes_with_observability, build_swarm, checkpoint_rotations_topic,
-        decode_snapshot_advertisement, decode_snapshot_chunk_request,
+        decode_finality_vote, decode_snapshot_advertisement, decode_snapshot_chunk_request,
         decode_snapshot_chunk_response, decode_sync_wire_message,
         decode_transaction_gossip_payload, decode_transaction_gossip_payload_zero_copy,
-        dedupe_multiaddrs, encode_snapshot_advertisement, encode_snapshot_chunk_request,
-        encode_snapshot_chunk_response, ip_to_default_multiaddrs, resolve_bootstrap_addresses,
-        split_txt_payload, sync_advertisements_topic, sync_chunks_topic, sync_requests_topic,
-        tokens_to_multiaddrs, transactions_topic, validate_block_gossip_payload_bounds,
+        dedupe_multiaddrs, encode_finality_vote, encode_snapshot_advertisement,
+        encode_snapshot_chunk_request, encode_snapshot_chunk_response, finality_votes_topic,
+        ip_to_default_multiaddrs, resolve_bootstrap_addresses, split_txt_payload,
+        sync_advertisements_topic, sync_chunks_topic, sync_requests_topic, tokens_to_multiaddrs,
+        transactions_topic, validate_block_gossip_payload_bounds,
     };
+    use crate::consensus::finality::FinalityVote;
     use crate::core::block::{Block, BlockHeader};
     use crate::core::state::AccountState;
     use crate::core::sync::{SnapshotAccount, StateSnapshot, split_snapshot_into_chunks};
@@ -963,6 +1016,7 @@ mod tests {
             checkpoint_rotations_topic().to_string(),
             "checkpoint-rotations"
         );
+        assert_eq!(finality_votes_topic().to_string(), "finality-votes");
     }
 
     #[test]
@@ -1030,6 +1084,25 @@ mod tests {
         let decoded = decode_snapshot_advertisement(&encoded.unwrap_or_else(|_| unreachable!()));
         assert!(decoded.is_ok(), "advertisement decode should succeed");
         assert_eq!(decoded.unwrap_or_else(|_| unreachable!()), advertisement);
+    }
+
+    #[test]
+    fn finality_vote_roundtrip_over_gossip_wire() {
+        let vote = FinalityVote {
+            network: 1,
+            height: 12,
+            round: 0,
+            block_hash: [8_u8; 32],
+            validator_address: "HMA_FINALITY_VALIDATOR".to_owned(),
+            validator_public_key: vec![2_u8; 32],
+            signature: vec![3_u8; 64],
+        };
+        let encoded = encode_finality_vote(&vote);
+        assert!(encoded.is_ok(), "finality vote encode should succeed");
+
+        let decoded = decode_finality_vote(&encoded.unwrap_or_else(|_| unreachable!()));
+        assert!(decoded.is_ok(), "finality vote decode should succeed");
+        assert_eq!(decoded.unwrap_or_else(|_| unreachable!()), vote);
     }
 
     #[test]

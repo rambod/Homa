@@ -11,6 +11,7 @@ use serde_json::json;
 use thiserror::Error;
 use tokio::sync::{Mutex, watch};
 
+use crate::consensus::finality::FinalityMode;
 use crate::core::indexer::FINALIZED_INDEX_FILE_NAME;
 use crate::core::mempool::MempoolConfig;
 use crate::core::mempool_checkpoint::MEMPOOL_CHECKPOINT_FILE_NAME;
@@ -134,6 +135,12 @@ struct NodeRunArgs {
     /// Number of recent finalized snapshots retained for serving peers.
     #[arg(long)]
     snapshot_serve_cache_entries: Option<usize>,
+    /// Block finalization mode.
+    #[arg(long, value_enum)]
+    finality_mode: Option<CliFinalityMode>,
+    /// Stake percentage required for quorum finality certificates.
+    #[arg(long)]
+    finality_quorum_threshold_percent: Option<u8>,
     /// Run only a bounded number of event-loop iterations then exit.
     #[arg(long)]
     max_steps: Option<usize>,
@@ -287,6 +294,23 @@ enum CliNetwork {
     Testnet,
     /// Local developer network.
     Devnet,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliFinalityMode {
+    /// Development self-finalization mode.
+    DevSelf,
+    /// Stake-weighted quorum certificate mode.
+    Quorum,
+}
+
+impl CliFinalityMode {
+    const fn into_finality_mode(self) -> FinalityMode {
+        match self {
+            Self::DevSelf => FinalityMode::DevSelf,
+            Self::Quorum => FinalityMode::Quorum,
+        }
+    }
 }
 
 impl CliNetwork {
@@ -635,6 +659,8 @@ fn daemon_config_from_runtime(
     config.ignore_mempool_checkpoint = runtime_config.ignore_mempool_checkpoint;
     config.sync_advertisement_interval_ms = runtime_config.sync_advertisement_interval_ms;
     config.snapshot_serve_cache_entries = runtime_config.snapshot_serve_cache_entries;
+    config.finality_mode = runtime_config.finality_mode;
+    config.finality_quorum_threshold_percent = runtime_config.finality_quorum_threshold_percent;
     config.producer_secret_key = runtime_config
         .producer_secret_key_bytes()
         .map_err(|source| NodeCliError::Config {
@@ -920,6 +946,8 @@ fn runtime_overrides_from_args(args: NodeRunArgs) -> NodeRuntimeOverrides {
         ignore_mempool_checkpoint: args.ignore_mempool_checkpoint,
         sync_advertisement_interval_ms: args.sync_advertisement_interval_ms,
         snapshot_serve_cache_entries: args.snapshot_serve_cache_entries,
+        finality_mode: args.finality_mode.map(CliFinalityMode::into_finality_mode),
+        finality_quorum_threshold_percent: args.finality_quorum_threshold_percent,
         max_steps: args.max_steps,
         state_directory: args.state_directory,
         producer_secret_key_hex: args.producer_secret_key_hex,

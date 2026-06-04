@@ -12,6 +12,10 @@ use libp2p::gossipsub::Event as GossipsubEvent;
 use libp2p::swarm::{Swarm, SwarmEvent};
 use thiserror::Error;
 
+use crate::consensus::finality::{
+    FinalityCertificate, FinalityError, FinalityMode, FinalityVote, certificate_from_votes,
+    sign_finality_vote, verify_finality_vote,
+};
 use crate::consensus::leader::{LeaderElectionError, elect_leader, record_slot_observation};
 use crate::consensus::stake::{StakeError, StakeLedger};
 use crate::core::block::{Block, BlockError};
@@ -46,9 +50,10 @@ use crate::network::checkpoint_rotation::{
 use crate::network::p2p::{
     DEFAULT_BOOTSTRAP_QUIC_PORT, DEFAULT_BOOTSTRAP_TCP_PORT, HomaBehaviour, HomaBehaviourEvent,
     NetworkError, P2PConfig, SnapshotAdvertisement, SnapshotChunkRequest, SnapshotChunkResponse,
-    add_kademlia_address, blocks_topic, bootstrap_dht, build_swarm, encode_snapshot_advertisement,
-    encode_snapshot_chunk_request, encode_snapshot_chunk_response, resolve_bootstrap_addresses,
-    sync_advertisements_topic, sync_chunks_topic, sync_requests_topic,
+    add_kademlia_address, blocks_topic, bootstrap_dht, build_swarm, encode_finality_vote,
+    encode_snapshot_advertisement, encode_snapshot_chunk_request, encode_snapshot_chunk_response,
+    finality_votes_topic, resolve_bootstrap_addresses, sync_advertisements_topic,
+    sync_chunks_topic, sync_requests_topic,
 };
 use crate::network::reputation::{AdaptivePenaltyPolicy, ReputationEvent, ReputationPolicy};
 use crate::network::runtime_loop::{
@@ -124,6 +129,10 @@ pub struct NodeDaemonConfig {
     pub sync_advertisement_interval_ms: u64,
     /// Number of recent finalized snapshots retained for serving peers.
     pub snapshot_serve_cache_entries: usize,
+    /// Block finalization mode.
+    pub finality_mode: FinalityMode,
+    /// Stake threshold required for finality quorum certificates.
+    pub finality_quorum_threshold_percent: u8,
     /// Bounded in-memory observability event capacity.
     pub observability_event_capacity: usize,
     /// Runtime event-loop tick interval in milliseconds.
@@ -183,6 +192,8 @@ impl Default for NodeDaemonConfig {
             snapshot_import_failure_policy: SnapshotImportFailurePolicy::default(),
             sync_advertisement_interval_ms: DEFAULT_SYNC_ADVERTISEMENT_INTERVAL_MS,
             snapshot_serve_cache_entries: DEFAULT_SNAPSHOT_SERVE_CACHE_ENTRIES,
+            finality_mode: FinalityMode::DevSelf,
+            finality_quorum_threshold_percent: 67,
             observability_event_capacity: crate::observability::DEFAULT_EVENT_CAPACITY,
             event_loop_tick_ms: DEFAULT_EVENT_LOOP_TICK_MS,
             slot_duration_ms: DEFAULT_SLOT_DURATION_MS,
@@ -238,6 +249,13 @@ pub enum NodeInboundOutcome {
     },
     /// Sync advertisement was accepted and any missing chunk requests were scheduled.
     SyncAdvertisementAccepted,
+    /// Finality vote was accepted by the daemon.
+    FinalityVoteAccepted {
+        /// Vote height.
+        height: u64,
+        /// Whether the accepted vote completed quorum certificate assembly.
+        certified: bool,
+    },
     /// Checkpoint trust-rotation update ingest outcome.
     CheckpointRotationIngested {
         /// Rotation ingest result.
@@ -268,6 +286,12 @@ pub struct NodeRuntimeStats {
     pub blocks_produced_total: u64,
     /// Number of produced block publish failures.
     pub block_publish_failure_total: u64,
+    /// Number of accepted finality votes.
+    pub finality_votes_total: u64,
+    /// Number of assembled finality certificates.
+    pub finality_certificates_total: u64,
+    /// Number of finality equivocation attempts observed.
+    pub finality_equivocations_total: u64,
     /// Number of pending-block queue evictions due to capacity bound.
     pub pending_block_evictions_total: u64,
     /// Number of accepted sync chunk requests.
@@ -362,6 +386,21 @@ pub struct NodeRecoveryReport {
     pub index_rebuild_performed: bool,
     /// Number of finalized events replayed into indexes during startup rebuild.
     pub index_events_replayed: usize,
+}
+
+/// Finality state snapshot exposed through RPC/status tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeFinalityStatus {
+    /// Configured finalization mode.
+    pub mode: FinalityMode,
+    /// Configured quorum threshold percentage.
+    pub quorum_threshold_percent: u8,
+    /// Latest quorum-certified height known locally.
+    pub certified_height: Option<u64>,
+    /// Latest quorum-certified block hash known locally.
+    pub certified_block_hash: Option<[u8; 32]>,
+    /// Number of certificates assembled and waiting for matching pending blocks.
+    pub pending_certificates: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -537,6 +576,12 @@ pub enum NodeDaemonError {
     SyncRuntimeConfig {
         /// Underlying sync runtime error.
         source: SyncRuntimeError,
+    },
+    /// Finality vote/certificate validation failed.
+    #[error("node daemon finality validation failed: {source}")]
+    Finality {
+        /// Underlying finality error.
+        source: FinalityError,
     },
     /// Inbound runtime-loop handling failed.
     #[error("node daemon inbound runtime-loop handling failed: {source}")]
@@ -739,6 +784,9 @@ struct ServedSnapshot {
     chunks: Vec<SnapshotChunk>,
 }
 
+type FinalityBlockKey = (u64, [u8; 32]);
+type FinalityEquivocationKey = (u64, String);
+
 /// Long-running daemon skeleton that wires runtime policy + sync + mempool handling.
 pub struct NodeDaemon {
     config: NodeDaemonConfig,
@@ -763,6 +811,10 @@ pub struct NodeDaemon {
     next_sync_request_id: u64,
     snapshot_serve_cache: VecDeque<ServedSnapshot>,
     advertised_finalized_blocks: HashMap<SnapshotStreamKey, Block>,
+    finality_votes: HashMap<FinalityBlockKey, BTreeMap<String, FinalityVote>>,
+    finality_certificates: HashMap<FinalityBlockKey, FinalityCertificate>,
+    finality_validator_votes: HashMap<FinalityEquivocationKey, [u8; 32]>,
+    latest_finality_certificate: Option<FinalityCertificate>,
     swarm: Option<Swarm<HomaBehaviour>>,
 }
 
@@ -952,6 +1004,10 @@ impl NodeDaemon {
             next_sync_request_id: 1,
             snapshot_serve_cache: VecDeque::new(),
             advertised_finalized_blocks: HashMap::new(),
+            finality_votes: HashMap::new(),
+            finality_certificates: HashMap::new(),
+            finality_validator_votes: HashMap::new(),
+            latest_finality_certificate: None,
             swarm: None,
         })
     }
@@ -1108,9 +1164,13 @@ impl NodeDaemon {
                         })?;
                 let height = block.header.height;
                 if queue_action == InboundBlockQueueAction::Queue {
-                    self.enqueue_pending_block(block);
+                    self.enqueue_pending_block(block.clone());
                     self.stats.blocks_queued_total =
                         self.stats.blocks_queued_total.saturating_add(1);
+                    if let Some(vote) = self.local_finality_vote_for_block(&block)? {
+                        let _ = self.ingest_verified_finality_vote(vote.clone());
+                        let _ = self.publish_finality_vote_best_effort(&vote);
+                    }
                     self.controller.record_peer_event(
                         peer_id,
                         ReputationEvent::HelpfulRelay,
@@ -1144,6 +1204,12 @@ impl NodeDaemon {
             InboundGossipAction::SyncAdvertisement(advertisement) => {
                 self.handle_sync_advertisement(peer_id, advertisement, now_ms)?;
                 Ok(NodeInboundOutcome::SyncAdvertisementAccepted)
+            }
+            InboundGossipAction::FinalityVote(vote) => {
+                let height = vote.height;
+                let certified = self.handle_finality_vote(peer_id, vote, now_ms)?;
+                self.stats.finality_votes_total = self.stats.finality_votes_total.saturating_add(1);
+                Ok(NodeInboundOutcome::FinalityVoteAccepted { height, certified })
             }
             InboundGossipAction::CheckpointRotation { outcome } => {
                 self.stats.checkpoint_rotations_total =
@@ -1282,10 +1348,23 @@ impl NodeDaemon {
                 address: producer_address.clone(),
             })?;
         let produced_block = candidate_block.with_proposer_proof(signature, public_key);
-        if self.apply_finalized_block(produced_block.clone()).is_err() {
-            let _ = record_slot_observation(&self.observability, slot, &producer_address, None);
-            self.stats.block_rejected_total = self.stats.block_rejected_total.saturating_add(1);
-            return Ok(NodeBlockProductionReport::default());
+        match self.config.finality_mode {
+            FinalityMode::DevSelf => {
+                if self.apply_finalized_block(produced_block.clone()).is_err() {
+                    let _ =
+                        record_slot_observation(&self.observability, slot, &producer_address, None);
+                    self.stats.block_rejected_total =
+                        self.stats.block_rejected_total.saturating_add(1);
+                    return Ok(NodeBlockProductionReport::default());
+                }
+            }
+            FinalityMode::Quorum => {
+                self.enqueue_pending_block(produced_block.clone());
+                if let Some(vote) = self.local_finality_vote_for_block(&produced_block)? {
+                    let _ = self.ingest_verified_finality_vote(vote.clone());
+                    let _ = self.publish_finality_vote_best_effort(&vote);
+                }
+            }
         }
 
         self.stats.blocks_produced_total = self.stats.blocks_produced_total.saturating_add(1);
@@ -1653,6 +1732,13 @@ impl NodeDaemon {
         self.publish_gossipsub_best_effort(sync_chunks_topic(), &payload)
     }
 
+    fn publish_finality_vote_best_effort(&mut self, vote: &FinalityVote) -> bool {
+        let Ok(payload) = encode_finality_vote(vote) else {
+            return false;
+        };
+        self.publish_gossipsub_best_effort(finality_votes_topic(), &payload)
+    }
+
     fn publish_gossipsub_best_effort(
         &mut self,
         topic: libp2p::gossipsub::IdentTopic,
@@ -1666,6 +1752,91 @@ impl NodeDaemon {
             .gossipsub
             .publish(topic, payload.to_owned())
             .is_ok()
+    }
+
+    fn local_finality_vote_for_block(
+        &self,
+        block: &Block,
+    ) -> Result<Option<FinalityVote>, NodeDaemonError> {
+        let Some(local_producer) = self.local_block_producer.as_ref() else {
+            return Ok(None);
+        };
+        if self.stake_ledger.stake_of(&local_producer.address) == 0 {
+            return Ok(None);
+        }
+        let block_hash = block
+            .hash()
+            .map_err(|source| NodeDaemonError::BlockBuild { source })?;
+        Ok(Some(sign_finality_vote(
+            self.config.network,
+            block.header.height,
+            0,
+            block_hash,
+            local_producer.address.clone(),
+            &local_producer.keypair,
+        )))
+    }
+
+    fn handle_finality_vote(
+        &mut self,
+        peer_id: &str,
+        vote: FinalityVote,
+        now_ms: u64,
+    ) -> Result<bool, NodeDaemonError> {
+        verify_finality_vote(&vote, self.config.network, &self.stake_ledger).map_err(|source| {
+            self.controller
+                .record_peer_event(peer_id, ReputationEvent::ProtocolViolation, now_ms);
+            NodeDaemonError::Finality { source }
+        })?;
+        self.ingest_verified_finality_vote(vote)
+    }
+
+    fn ingest_verified_finality_vote(
+        &mut self,
+        vote: FinalityVote,
+    ) -> Result<bool, NodeDaemonError> {
+        let equivocation_key = (vote.height, vote.validator_address.clone());
+        if let Some(existing_hash) = self
+            .finality_validator_votes
+            .get(&equivocation_key)
+            .copied()
+        {
+            if existing_hash != vote.block_hash {
+                self.stats.finality_equivocations_total =
+                    self.stats.finality_equivocations_total.saturating_add(1);
+                return Ok(false);
+            }
+        } else {
+            let _ = self
+                .finality_validator_votes
+                .insert(equivocation_key, vote.block_hash);
+        }
+
+        let block_key = (vote.height, vote.block_hash);
+        let votes = self.finality_votes.entry(block_key).or_default();
+        let _ = votes.insert(vote.validator_address.clone(), vote);
+        let certificate = certificate_from_votes(
+            votes.values(),
+            self.config.network,
+            &self.stake_ledger,
+            self.config.finality_quorum_threshold_percent,
+            0,
+        );
+        match certificate {
+            Ok(certificate) => {
+                let is_new = self
+                    .finality_certificates
+                    .insert(block_key, certificate)
+                    .is_none();
+                if is_new {
+                    self.stats.finality_certificates_total =
+                        self.stats.finality_certificates_total.saturating_add(1);
+                }
+                Ok(is_new)
+            }
+            Err(FinalityError::QuorumNotReached { .. }) => Ok(false),
+            Err(source) => Err(NodeDaemonError::Finality { source }),
+        }
     }
 
     fn handle_sync_advertisement(
@@ -1954,6 +2125,24 @@ impl NodeDaemon {
         self.config.network
     }
 
+    /// Returns current finality mode and certificate summary.
+    #[must_use]
+    pub fn finality_status(&self) -> NodeFinalityStatus {
+        NodeFinalityStatus {
+            mode: self.config.finality_mode,
+            quorum_threshold_percent: self.config.finality_quorum_threshold_percent,
+            certified_height: self
+                .latest_finality_certificate
+                .as_ref()
+                .map(|certificate| certificate.height),
+            certified_block_hash: self
+                .latest_finality_certificate
+                .as_ref()
+                .map(|certificate| certificate.block_hash),
+            pending_certificates: self.finality_certificates.len(),
+        }
+    }
+
     /// Returns immutable finalized block metadata.
     #[must_use]
     pub const fn finalized_block(&self) -> &Block {
@@ -2225,6 +2414,9 @@ impl NodeDaemon {
                 block.header.height == expected_height
                     && block.header.previous_block_hash == finalized_hash
             }) {
+                if !self.pending_block_has_required_finality(index)? {
+                    break;
+                }
                 let Some(candidate) = self.pending_blocks.remove(index) else {
                     break;
                 };
@@ -2255,11 +2447,35 @@ impl NodeDaemon {
     }
 
     fn try_finalize_pending_block(&mut self, block: Block) -> bool {
+        let block_key = match block.hash() {
+            Ok(block_hash) => Some((block.header.height, block_hash)),
+            Err(_) => None,
+        };
         if self.apply_finalized_block(block).is_err() {
             self.stats.block_rejected_total = self.stats.block_rejected_total.saturating_add(1);
             return false;
         }
+        if let Some(block_key) = block_key
+            && let Some(certificate) = self.finality_certificates.remove(&block_key)
+        {
+            self.latest_finality_certificate = Some(certificate);
+        }
         true
+    }
+
+    fn pending_block_has_required_finality(&self, index: usize) -> Result<bool, NodeDaemonError> {
+        if self.config.finality_mode == FinalityMode::DevSelf {
+            return Ok(true);
+        }
+        let Some(block) = self.pending_blocks.get(index) else {
+            return Ok(false);
+        };
+        let block_hash = block
+            .hash()
+            .map_err(|source| NodeDaemonError::FinalizedBlockHash { source })?;
+        Ok(self
+            .finality_certificates
+            .contains_key(&(block.header.height, block_hash)))
     }
 
     fn remove_included_transactions_from_mempool(&mut self, block: &Block) {
@@ -2692,6 +2908,7 @@ mod tests {
         NodeDaemon, NodeDaemonConfig, NodeDaemonError, NodeInboundOutcome, NodeLifecycleState,
         stake_ledger_from_genesis, trusted_checkpoint_set_from_genesis,
     };
+    use crate::consensus::finality::{FinalityMode, sign_finality_vote};
     use crate::consensus::leader::elect_leader;
     use crate::core::block::{Block, BlockHeader};
     use crate::core::genesis::{
@@ -2709,9 +2926,9 @@ mod tests {
     use crate::crypto::address::{Network, derive_address};
     use crate::crypto::keys::Keypair;
     use crate::network::p2p::{
-        BLOCKS_TOPIC, MAX_BLOCK_GOSSIP_BYTES, NetworkError, SYNC_CHUNKS_TOPIC,
-        SnapshotChunkRequest, SnapshotChunkResponse, TRANSACTIONS_TOPIC,
-        encode_snapshot_chunk_response,
+        BLOCKS_TOPIC, FINALITY_VOTES_TOPIC, MAX_BLOCK_GOSSIP_BYTES, NetworkError,
+        SYNC_CHUNKS_TOPIC, SnapshotChunkRequest, SnapshotChunkResponse, TRANSACTIONS_TOPIC,
+        encode_finality_vote, encode_snapshot_chunk_response,
     };
     use crate::network::runtime_loop::RuntimeLoopError;
     use crate::network::sync_engine::{RequestSchedulerPolicy, SYNC_SESSION_CHECKPOINT_FILE_NAME};
@@ -2748,6 +2965,32 @@ mod tests {
         config.slot_duration_ms = DEFAULT_SLOT_DURATION_MS;
         config.producer_secret_key = Some([1_u8; 32]);
         config.max_block_transactions = 64;
+
+        let trusted = trusted_checkpoint_set_from_genesis(network);
+        assert!(trusted.is_ok(), "trusted-set bootstrap should succeed");
+        let trusted = trusted.unwrap_or_else(|_| unreachable!());
+        let stake_ledger = stake_ledger_from_genesis(network);
+        assert!(
+            stake_ledger.is_ok(),
+            "stake ledger bootstrap should succeed"
+        );
+        let stake_ledger = stake_ledger.unwrap_or_else(|_| unreachable!());
+        let forged = forge_genesis(network);
+        assert!(forged.is_ok(), "genesis forge should succeed");
+        let (genesis_block, chain_state) = forged.unwrap_or_else(|_| unreachable!());
+
+        let daemon = NodeDaemon::new(config, genesis_block, chain_state, trusted, stake_ledger);
+        assert!(daemon.is_ok(), "daemon should initialize");
+        daemon.unwrap_or_else(|_| unreachable!())
+    }
+
+    fn daemon_with_quorum_finality(network: Network) -> NodeDaemon {
+        let mut config = NodeDaemonConfig::for_network(network);
+        config.mempool_config = MempoolConfig::new(10_000, 0, network);
+        config.max_pending_blocks = 16;
+        config.slot_duration_ms = DEFAULT_SLOT_DURATION_MS;
+        config.finality_mode = FinalityMode::Quorum;
+        config.finality_quorum_threshold_percent = 67;
 
         let trusted = trusted_checkpoint_set_from_genesis(network);
         assert!(trusted.is_ok(), "trusted-set bootstrap should succeed");
@@ -2903,6 +3146,31 @@ mod tests {
 
         unsigned
             .with_signature(sender_keypair.sign(&signing_bytes.unwrap_or_else(|_| unreachable!())))
+    }
+
+    fn finality_vote_payload_for_block(
+        network: Network,
+        block: &Block,
+        validator_seed: u8,
+    ) -> Vec<u8> {
+        let keypair = Keypair::from_secret_key(&[validator_seed; 32]);
+        assert!(keypair.is_ok(), "validator key should parse");
+        let keypair = keypair.unwrap_or_else(|_| unreachable!());
+        let validator_address = derive_address(&keypair.public_key_bytes(), network);
+        assert!(validator_address.is_ok(), "validator address should derive");
+        let block_hash = block.hash();
+        assert!(block_hash.is_ok(), "block hash should compute");
+        let vote = sign_finality_vote(
+            network,
+            block.header.height,
+            0,
+            block_hash.unwrap_or_else(|_| unreachable!()),
+            validator_address.unwrap_or_else(|_| unreachable!()),
+            &keypair,
+        );
+        let encoded = encode_finality_vote(&vote);
+        assert!(encoded.is_ok(), "finality vote should encode");
+        encoded.unwrap_or_else(|_| unreachable!())
     }
 
     fn invalid_checkpoint_transaction(network: Network) -> Transaction {
@@ -3385,6 +3653,120 @@ mod tests {
         assert_eq!(daemon.pending_block_count(), 0);
         assert_eq!(daemon.stats().blocks_finalized_total, 1);
         assert_eq!(daemon.stats().block_rejected_total, 0);
+    }
+
+    #[test]
+    fn quorum_finality_keeps_pending_block_without_certificate() {
+        let network = Network::Testnet;
+        let mut daemon = daemon_with_quorum_finality(network);
+        let slot = 0_u64;
+        let timestamp_unix_ms = timestamp_for_slot(slot, DEFAULT_SLOT_DURATION_MS);
+        let proposer = leader_for_slot(network, slot);
+
+        let block = empty_child_block(
+            network,
+            daemon.finalized_block(),
+            daemon.chain_state().state_root(),
+            timestamp_unix_ms,
+            proposer,
+        );
+        let payload = block.encode();
+        assert!(payload.is_ok(), "block should encode");
+        let handled = daemon.handle_inbound_gossip_message(
+            BLOCKS_TOPIC,
+            &payload.unwrap_or_else(|_| unreachable!()),
+            "peer-quorum-block",
+            timestamp_unix_ms,
+        );
+        assert!(
+            matches!(handled, Ok(NodeInboundOutcome::BlockQueued { height: 1 })),
+            "valid quorum-mode block should queue before finality"
+        );
+
+        let report = daemon.run_maintenance_tick(timestamp_unix_ms.saturating_add(100));
+        assert!(report.is_ok(), "maintenance should run");
+        let report = report.unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            report.finalized_blocks, 0,
+            "quorum mode must wait for a certificate"
+        );
+        assert_eq!(daemon.finalized_block().header.height, 0);
+        assert_eq!(daemon.pending_block_count(), 1);
+    }
+
+    #[test]
+    fn quorum_finality_finalizes_after_stake_weighted_votes() {
+        let network = Network::Testnet;
+        let mut daemon = daemon_with_quorum_finality(network);
+        let slot = 0_u64;
+        let timestamp_unix_ms = timestamp_for_slot(slot, DEFAULT_SLOT_DURATION_MS);
+        let proposer = leader_for_slot(network, slot);
+
+        let block = empty_child_block(
+            network,
+            daemon.finalized_block(),
+            daemon.chain_state().state_root(),
+            timestamp_unix_ms,
+            proposer,
+        );
+        let payload = block.encode();
+        assert!(payload.is_ok(), "block should encode");
+        let handled = daemon.handle_inbound_gossip_message(
+            BLOCKS_TOPIC,
+            &payload.unwrap_or_else(|_| unreachable!()),
+            "peer-quorum-block",
+            timestamp_unix_ms,
+        );
+        assert!(
+            matches!(handled, Ok(NodeInboundOutcome::BlockQueued { height: 1 })),
+            "valid quorum-mode block should queue before finality"
+        );
+
+        let first_vote = finality_vote_payload_for_block(network, &block, 1);
+        let first = daemon.handle_inbound_gossip_message(
+            FINALITY_VOTES_TOPIC,
+            &first_vote,
+            "peer-finality-one",
+            timestamp_unix_ms.saturating_add(10),
+        );
+        assert!(
+            matches!(
+                first,
+                Ok(NodeInboundOutcome::FinalityVoteAccepted {
+                    height: 1,
+                    certified: false
+                })
+            ),
+            "single validator stake should not meet quorum"
+        );
+
+        let second_vote = finality_vote_payload_for_block(network, &block, 2);
+        let second = daemon.handle_inbound_gossip_message(
+            FINALITY_VOTES_TOPIC,
+            &second_vote,
+            "peer-finality-two",
+            timestamp_unix_ms.saturating_add(20),
+        );
+        assert!(
+            matches!(
+                second,
+                Ok(NodeInboundOutcome::FinalityVoteAccepted {
+                    height: 1,
+                    certified: true
+                })
+            ),
+            "validator one plus two should satisfy 67 percent stake quorum"
+        );
+        assert_eq!(daemon.stats().finality_votes_total, 2);
+        assert_eq!(daemon.stats().finality_certificates_total, 1);
+
+        let report = daemon.run_maintenance_tick(timestamp_unix_ms.saturating_add(100));
+        assert!(report.is_ok(), "maintenance should run");
+        let report = report.unwrap_or_else(|_| unreachable!());
+        assert_eq!(report.finalized_blocks, 1);
+        assert_eq!(daemon.finalized_block().header.height, 1);
+        assert_eq!(daemon.pending_block_count(), 0);
+        assert_eq!(daemon.finality_status().certified_height, Some(1));
     }
 
     #[test]

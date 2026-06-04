@@ -18,6 +18,7 @@ Implemented in this repository today:
 - snapshot fast-sync with checkpoint verification and anti-rollback protections
 - P2P transport and sync wire codecs
 - peer reputation, adaptive penalties, and checkpoint-trust rotation logic
+- distributed finality primitives with validator vote signing, quorum certificate assembly, finality vote gossip, and quorum-gated daemon mode
 - node daemon runtime loop wiring with bounded pending-block finalization
 - deterministic local block production (slot-scheduled leader gating + self-finalization)
 - inbound block consensus admission hardening (slot leader checks, timestamp drift limits, same-slot equivocation detection)
@@ -34,7 +35,7 @@ Implemented in this repository today:
 
 Not production-ready yet (remaining major gaps):
 
-- distributed validator quorum/finality certificates beyond local proposer self-finalization
+- real-swarm distributed finality hardening: partition semantics, certificate persistence/index exposure, and multi-process quorum devnet tests
 - on-chain validator/staking lifecycle, validator-set epochs, and unbonding/slashing policy
 - end-to-end real multi-node devnet automation that proves libp2p gossip, sync serving, RPC, persistence, and block production together
 - production deployment hardening: generated per-node configs, stable listen ports, secret handling, metrics/alerting, backup drills, and release artifacts
@@ -244,11 +245,15 @@ Useful options:
 - `--ignore-mempool-checkpoint <BOOL>` skip mempool checkpoint ingestion during startup
 - `--sync-advertisement-interval-ms <U64>` finalized snapshot advertisement interval
 - `--snapshot-serve-cache-entries <USIZE>` number of recent snapshots retained for peer sync serving
+- `--finality-mode <dev-self|quorum>` finalization mode; `dev-self` is the default local mode, `quorum` requires validator votes before finalizing queued blocks
+- `--finality-quorum-threshold-percent <U8>` stake threshold for quorum finality certificates (default `67`)
 
 Runtime behavior notes:
 
 - each maintenance tick processes timeout/retry feedback, then attempts bounded pending-block finalization
 - if a local producer key is configured, each new slot performs deterministic leader election and produces at most one block when local validator is elected
+- in `dev_self` finality mode, valid locally processed blocks can self-finalize for development and smoke tests
+- in `quorum` finality mode, pending blocks advance only after stake-weighted validator votes assemble a finality certificate
 - inbound blocks are consensus-gated before queueing: proposer proof verification, timestamp skew bounds, proposer-vs-slot leader check, same-slot equivocation rejection, stale-height replay rejection, and finalized-boundary parent-hash checks
 - when `state_directory` is configured, daemon startup attempts persisted restore (chain snapshot + finalized-block checkpoint) and falls back to genesis only if no persisted state exists
 - recovered sync checkpoints sanitize stranded in-flight request/chunk transport state during startup so restart never depends on volatile pre-crash request-session bindings
@@ -331,6 +336,7 @@ Current gossip topics:
 
 - `transactions`
 - `blocks`
+- `finality-votes`
 - `sync-requests`
 - `sync-chunks`
 - `sync-advertisements`
@@ -347,6 +353,13 @@ Sync transport includes:
 - optional strict checkpoint-aware handshake validation
 - persisted sync-session checkpoint state for restart continuity
 - restart-time sanitization of recovered in-flight transport state before runtime sync re-entry
+
+Finality transport includes:
+
+- bounded finality vote encode/decode
+- network-domain-separated vote signatures over height, round, block hash, and validator identity
+- duplicate-vote suppression and same-height validator equivocation accounting
+- quorum certificate assembly from the static genesis stake ledger
 
 ## Testing and Fuzzing
 

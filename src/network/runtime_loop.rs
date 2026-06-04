@@ -2,15 +2,16 @@
 
 use thiserror::Error;
 
+use crate::consensus::finality::FinalityVote;
 use crate::core::transaction::Transaction;
 use crate::network::checkpoint_rotation::{
     CheckpointRotationError, CheckpointSetRotationUpdate, RotationIngestOutcome,
 };
 use crate::network::p2p::{
-    BLOCKS_TOPIC, CHECKPOINT_ROTATIONS_TOPIC, NetworkError, SYNC_ADVERTISEMENTS_TOPIC,
-    SYNC_CHUNKS_TOPIC, SYNC_REQUESTS_TOPIC, SnapshotAdvertisement, SnapshotChunkRequest,
-    SnapshotChunkResponse, TRANSACTIONS_TOPIC, decode_snapshot_advertisement,
-    decode_snapshot_chunk_request, decode_snapshot_chunk_response,
+    BLOCKS_TOPIC, CHECKPOINT_ROTATIONS_TOPIC, FINALITY_VOTES_TOPIC, NetworkError,
+    SYNC_ADVERTISEMENTS_TOPIC, SYNC_CHUNKS_TOPIC, SYNC_REQUESTS_TOPIC, SnapshotAdvertisement,
+    SnapshotChunkRequest, SnapshotChunkResponse, TRANSACTIONS_TOPIC, decode_finality_vote,
+    decode_snapshot_advertisement, decode_snapshot_chunk_request, decode_snapshot_chunk_response,
     decode_transaction_gossip_payload, validate_block_gossip_payload_bounds,
 };
 use crate::network::reputation::ReputationEvent;
@@ -31,6 +32,8 @@ pub enum InboundGossipAction {
     SyncChunkResponse(SnapshotChunkResponse),
     /// Decoded finalized snapshot advertisement.
     SyncAdvertisement(SnapshotAdvertisement),
+    /// Decoded validator finality vote.
+    FinalityVote(FinalityVote),
     /// Checkpoint trust-set rotation update outcome.
     CheckpointRotation {
         /// Rotation ingest decision.
@@ -104,6 +107,11 @@ pub fn handle_inbound_gossip_message(
             Ok(InboundGossipAction::SyncAdvertisement(advertisement))
         }
         CHECKPOINT_ROTATIONS_TOPIC => handle_checkpoint_rotation_topic(controller, payload),
+        FINALITY_VOTES_TOPIC => {
+            let vote = decode_finality_vote(payload)
+                .map_err(|source| RuntimeLoopError::Network { source })?;
+            Ok(InboundGossipAction::FinalityVote(vote))
+        }
         _ => Err(RuntimeLoopError::UnknownTopic {
             topic: topic.to_owned(),
         }),
@@ -207,6 +215,7 @@ mod tests {
         handle_inbound_gossip_message_with_feedback,
         handle_inbound_gossip_message_with_feedback_and_sync_runtime,
     };
+    use crate::consensus::finality::FinalityVote;
     use crate::core::state::AccountState;
     use crate::core::sync::{SnapshotAccount, StateSnapshot, split_snapshot_into_chunks};
     use crate::core::transaction::Transaction;
@@ -217,9 +226,9 @@ mod tests {
         TrustedCheckpointSet, sign_checkpoint_set_rotation,
     };
     use crate::network::p2p::{
-        BLOCKS_TOPIC, CHECKPOINT_ROTATIONS_TOPIC, MAX_BLOCK_GOSSIP_BYTES, NetworkError,
-        SYNC_CHUNKS_TOPIC, SYNC_REQUESTS_TOPIC, TRANSACTIONS_TOPIC, encode_snapshot_chunk_request,
-        encode_snapshot_chunk_response,
+        BLOCKS_TOPIC, CHECKPOINT_ROTATIONS_TOPIC, FINALITY_VOTES_TOPIC, MAX_BLOCK_GOSSIP_BYTES,
+        NetworkError, SYNC_CHUNKS_TOPIC, SYNC_REQUESTS_TOPIC, TRANSACTIONS_TOPIC,
+        encode_finality_vote, encode_snapshot_chunk_request, encode_snapshot_chunk_response,
     };
     use crate::network::reputation::{AdaptivePenaltyPolicy, ReputationEvent, ReputationPolicy};
     use crate::network::runtime_policy::{RuntimePolicyError, SyncRuntimePolicyController};
@@ -285,6 +294,18 @@ mod tests {
         });
         assert!(payload.is_ok(), "request encoding should succeed");
         payload.unwrap_or_else(|_| unreachable!())
+    }
+
+    fn sample_finality_vote() -> FinalityVote {
+        FinalityVote {
+            network: Network::Testnet.as_byte(),
+            height: 12,
+            round: 0,
+            block_hash: [8_u8; 32],
+            validator_address: "HMA_RUNTIME_FINALITY".to_owned(),
+            validator_public_key: vec![2_u8; 32],
+            signature: vec![3_u8; 64],
+        }
     }
 
     fn sample_sync_runtime() -> SyncRuntimeCoordinator {
@@ -491,6 +512,27 @@ mod tests {
                 })
             ),
             "oversized block gossip payload must be rejected at runtime boundary"
+        );
+    }
+
+    #[test]
+    fn finality_vote_topic_decodes_vote_payload() {
+        let mut controller = controller_with_quota(4);
+        let vote = sample_finality_vote();
+        let encoded = encode_finality_vote(&vote);
+        assert!(encoded.is_ok(), "finality vote should encode");
+
+        let handled = handle_inbound_gossip_message(
+            &mut controller,
+            FINALITY_VOTES_TOPIC,
+            &encoded.unwrap_or_else(|_| unreachable!()),
+            "peer-finality",
+            5_500,
+        );
+
+        assert!(
+            matches!(handled, Ok(InboundGossipAction::FinalityVote(decoded)) if decoded == vote),
+            "finality vote topic should decode into finality vote action"
         );
     }
 

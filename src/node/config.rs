@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::consensus::finality::FinalityMode;
 use crate::crypto::address::Network;
 use crate::crypto::keys::SECRET_KEY_LENGTH;
 
@@ -22,6 +23,7 @@ const DEFAULT_RPC_RATE_LIMIT_PER_SEC: u32 = 100;
 const DEFAULT_WS_MAX_SUBSCRIPTIONS_PER_CONN: usize = 32;
 const DEFAULT_SYNC_ADVERTISEMENT_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_SNAPSHOT_SERVE_CACHE_ENTRIES: usize = 4;
+const DEFAULT_FINALITY_QUORUM_THRESHOLD_PERCENT: u8 = 67;
 
 /// Typed network selector for node configuration files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -99,6 +101,10 @@ pub struct NodeRuntimeConfig {
     pub sync_advertisement_interval_ms: u64,
     /// Number of recent finalized snapshots retained for serving peers.
     pub snapshot_serve_cache_entries: usize,
+    /// Finalization mode for accepted/produced blocks.
+    pub finality_mode: FinalityMode,
+    /// Stake threshold required for quorum finality certificates.
+    pub finality_quorum_threshold_percent: u8,
     /// Optional bounded run-step count for smoke testing.
     pub max_steps: Option<usize>,
     /// Optional persistence directory used for graceful shutdown checkpointing.
@@ -133,6 +139,8 @@ impl Default for NodeRuntimeConfig {
             ignore_mempool_checkpoint: false,
             sync_advertisement_interval_ms: DEFAULT_SYNC_ADVERTISEMENT_INTERVAL_MS,
             snapshot_serve_cache_entries: DEFAULT_SNAPSHOT_SERVE_CACHE_ENTRIES,
+            finality_mode: FinalityMode::default(),
+            finality_quorum_threshold_percent: DEFAULT_FINALITY_QUORUM_THRESHOLD_PERCENT,
             max_steps: None,
             state_directory: None,
             producer_secret_key_hex: None,
@@ -190,6 +198,10 @@ pub struct NodeRuntimeOverrides {
     pub sync_advertisement_interval_ms: Option<u64>,
     /// Optional snapshot serve cache entry-count override.
     pub snapshot_serve_cache_entries: Option<usize>,
+    /// Optional finality mode override.
+    pub finality_mode: Option<FinalityMode>,
+    /// Optional finality quorum threshold override.
+    pub finality_quorum_threshold_percent: Option<u8>,
     /// Optional bounded step count override.
     pub max_steps: Option<usize>,
     /// Optional persistence directory override.
@@ -282,6 +294,13 @@ impl NodeRuntimeConfig {
         if let Some(snapshot_serve_cache_entries) = overrides.snapshot_serve_cache_entries {
             self.snapshot_serve_cache_entries = snapshot_serve_cache_entries;
         }
+        if let Some(finality_mode) = overrides.finality_mode {
+            self.finality_mode = finality_mode;
+        }
+        if let Some(finality_quorum_threshold_percent) = overrides.finality_quorum_threshold_percent
+        {
+            self.finality_quorum_threshold_percent = finality_quorum_threshold_percent;
+        }
         if let Some(max_steps) = overrides.max_steps {
             self.max_steps = Some(max_steps);
         }
@@ -354,6 +373,13 @@ impl NodeRuntimeConfig {
         if self.snapshot_serve_cache_entries == 0 {
             return Err(NodeConfigError::InvalidSnapshotServeCacheEntries {
                 snapshot_serve_cache_entries: self.snapshot_serve_cache_entries,
+            });
+        }
+        if self.finality_quorum_threshold_percent == 0
+            || self.finality_quorum_threshold_percent > 100
+        {
+            return Err(NodeConfigError::InvalidFinalityQuorumThresholdPercent {
+                finality_quorum_threshold_percent: self.finality_quorum_threshold_percent,
             });
         }
         if self.rpc_listen_addr.parse::<SocketAddr>().is_err() {
@@ -518,6 +544,12 @@ pub enum NodeConfigError {
         /// Configured value.
         listen_multiaddr: String,
     },
+    /// Finality quorum threshold must be 1..=100.
+    #[error("invalid node config: finality_quorum_threshold_percent must be between 1 and 100")]
+    InvalidFinalityQuorumThresholdPercent {
+        /// Configured value.
+        finality_quorum_threshold_percent: u8,
+    },
     /// Minimum `PoW` bits must fit algorithm bounds.
     #[error(
         "invalid node config: min_pow_bits={min_pow_bits} exceeds supported maximum {max_pow_bits}"
@@ -557,6 +589,7 @@ pub enum NodeConfigError {
 #[cfg(test)]
 mod tests {
     use super::{NodeConfigError, NodeRuntimeConfig, NodeRuntimeOverrides};
+    use crate::consensus::finality::FinalityMode;
     use crate::crypto::keys::SECRET_KEY_LENGTH;
     use std::fs;
 
@@ -599,6 +632,8 @@ repair_index = true
 ignore_mempool_checkpoint = true
 sync_advertisement_interval_ms = 2500
 snapshot_serve_cache_entries = 6
+finality_mode = "quorum"
+finality_quorum_threshold_percent = 70
 max_steps = 5
 state_directory = "state/devnet"
 "#;
@@ -631,6 +666,8 @@ state_directory = "state/devnet"
         assert!(loaded.ignore_mempool_checkpoint);
         assert_eq!(loaded.sync_advertisement_interval_ms, 2_500);
         assert_eq!(loaded.snapshot_serve_cache_entries, 6);
+        assert_eq!(loaded.finality_mode, FinalityMode::Quorum);
+        assert_eq!(loaded.finality_quorum_threshold_percent, 70);
         assert_eq!(loaded.max_steps, Some(5));
 
         let cleanup = fs::remove_file(path);
@@ -714,6 +751,8 @@ state_directory = "state/devnet"
             ignore_mempool_checkpoint: Some(true),
             sync_advertisement_interval_ms: Some(2_500),
             snapshot_serve_cache_entries: Some(8),
+            finality_mode: Some(FinalityMode::Quorum),
+            finality_quorum_threshold_percent: Some(75),
             max_steps: Some(2),
             ..NodeRuntimeOverrides::default()
         };
@@ -748,7 +787,27 @@ state_directory = "state/devnet"
         assert!(config.ignore_mempool_checkpoint);
         assert_eq!(config.sync_advertisement_interval_ms, 2_500);
         assert_eq!(config.snapshot_serve_cache_entries, 8);
+        assert_eq!(config.finality_mode, FinalityMode::Quorum);
+        assert_eq!(config.finality_quorum_threshold_percent, 75);
         assert_eq!(config.max_steps, Some(2));
+    }
+
+    #[test]
+    fn rejects_invalid_finality_quorum_threshold() {
+        let config = NodeRuntimeConfig {
+            finality_quorum_threshold_percent: 0,
+            ..NodeRuntimeConfig::default()
+        };
+        let validation = config.validate();
+        assert!(
+            matches!(
+                validation,
+                Err(NodeConfigError::InvalidFinalityQuorumThresholdPercent {
+                    finality_quorum_threshold_percent: 0
+                })
+            ),
+            "zero finality quorum threshold must be rejected"
+        );
     }
 
     #[test]

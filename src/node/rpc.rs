@@ -21,7 +21,9 @@ use tokio::sync::{Mutex, broadcast, watch};
 use crate::core::mempool::TransactionId;
 use crate::crypto::address::Network;
 use crate::network::p2p::TRANSACTIONS_TOPIC;
-use crate::node::daemon::{NodeDaemon, NodeDaemonError, NodeLifecycleState, NodeRuntimeStats};
+use crate::node::daemon::{
+    NodeDaemon, NodeDaemonError, NodeFinalityStatus, NodeLifecycleState, NodeRuntimeStats,
+};
 
 const RPC_JSON_VERSION: &str = "2.0";
 
@@ -389,6 +391,7 @@ async fn rpc_get_status(app_state: &RpcAppState) -> Result<Value, RpcErrorObject
         finalized_hash_hex,
         mempool_size,
         pending_blocks,
+        finality_status,
         runtime_stats,
     ) = {
         let daemon = app_state.daemon.lock().await;
@@ -403,6 +406,7 @@ async fn rpc_get_status(app_state: &RpcAppState) -> Result<Value, RpcErrorObject
             hex::encode(finalized_hash),
             daemon.mempool_len(),
             daemon.pending_block_count(),
+            daemon.finality_status(),
             daemon.stats(),
         )
     };
@@ -413,6 +417,7 @@ async fn rpc_get_status(app_state: &RpcAppState) -> Result<Value, RpcErrorObject
         "finalized_hash": finalized_hash_hex,
         "mempool_size": mempool_size,
         "pending_blocks": pending_blocks,
+        "finality": finality_status_json(&finality_status),
         "stats": stats_json(runtime_stats),
     }))
 }
@@ -901,6 +906,7 @@ fn map_daemon_error(error: &NodeDaemonError) -> RpcErrorObject {
         NodeDaemonError::BlockDecode { source: _ } => (-32_122, "Block payload decode failed"),
         NodeDaemonError::Indexer { source: _ } => (-32_130, "Indexer operation failed"),
         NodeDaemonError::Network { source: _ } => (-32_140, "Network operation failed"),
+        NodeDaemonError::Finality { source: _ } => (-32_150, "Finality validation failed"),
         _ => (-32_603, "Internal daemon error"),
     };
     RpcErrorObject {
@@ -922,7 +928,27 @@ fn stats_json(stats: NodeRuntimeStats) -> Value {
         "inbound_block_duplicate_total": stats.inbound_block_duplicate_total,
         "blocks_produced_total": stats.blocks_produced_total,
         "block_publish_failure_total": stats.block_publish_failure_total,
+        "finality_votes_total": stats.finality_votes_total,
+        "finality_certificates_total": stats.finality_certificates_total,
+        "finality_equivocations_total": stats.finality_equivocations_total,
     })
+}
+
+fn finality_status_json(status: &NodeFinalityStatus) -> Value {
+    json!({
+        "mode": finality_mode_label(status.mode),
+        "quorum_threshold_percent": status.quorum_threshold_percent,
+        "certified_height": status.certified_height,
+        "certified_block_hash": status.certified_block_hash.map(hex::encode),
+        "pending_certificates": status.pending_certificates,
+    })
+}
+
+const fn finality_mode_label(mode: crate::consensus::finality::FinalityMode) -> &'static str {
+    match mode {
+        crate::consensus::finality::FinalityMode::DevSelf => "dev_self",
+        crate::consensus::finality::FinalityMode::Quorum => "quorum",
+    }
 }
 
 const fn lifecycle_label(state: NodeLifecycleState) -> &'static str {

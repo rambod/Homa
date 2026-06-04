@@ -67,6 +67,8 @@ repair_index = false
 ignore_mempool_checkpoint = false
 sync_advertisement_interval_ms = 5000
 snapshot_serve_cache_entries = 4
+finality_mode = "dev_self"
+finality_quorum_threshold_percent = 67
 state_directory = "${node_dir}/state"
 producer_secret_key_hex = "${key}"
 EOF
@@ -112,6 +114,8 @@ repair_index = false
 ignore_mempool_checkpoint = false
 sync_advertisement_interval_ms = 5000
 snapshot_serve_cache_entries = 4
+finality_mode = "dev_self"
+finality_quorum_threshold_percent = 67
 state_directory = "/var/lib/homa"
 producer_secret_key_hex = "${key}"
 EOF
